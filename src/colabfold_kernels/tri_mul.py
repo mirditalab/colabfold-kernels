@@ -18,11 +18,12 @@ from jax.experimental.pallas import triton as plgpu
 _dot = functools.partial(jnp.dot, preferred_element_type=jnp.float32)
 
 
-def _gdp_kernel(x_ref, wp_ref, bp_ref, wg_ref, bg_ref, mask_ref, o_ref):
+def _gdp_kernel(x_ref, wp_ref, bp_ref, wg_ref, bg_ref, mask_ref, o_ref, *,
+                activation=jax.nn.sigmoid):
   x = x_ref[...]                                      # [BM, K] bf16
   proj = _dot(x, wp_ref[...]) + bp_ref[...][None, :].astype(jnp.float32)
   gate = _dot(x, wg_ref[...]) + bg_ref[...][None, :].astype(jnp.float32)
-  o = mask_ref[...][:, None].astype(jnp.float32) * proj * jax.nn.sigmoid(gate)
+  o = mask_ref[...][:, None].astype(jnp.float32) * proj * activation(gate)
   o_ref[...] = o.astype(o_ref.dtype)
 
 
@@ -59,9 +60,10 @@ def _gdp_kernel_split(x_ref, wpl_ref, bpl_ref, wgl_ref, bgl_ref,
                       m).astype(or_ref.dtype)
 
 
-@functools.partial(jax.jit, static_argnames=("block_m", "split", "channel_major"))
+@functools.partial(jax.jit,
+                   static_argnames=("block_m", "split", "channel_major", "activation"))
 def gated_dual_proj(x, wp, bp, wg, bg, mask, *, block_m=64, split=False,
-                    channel_major=False):
+                    channel_major=False, activation=jax.nn.sigmoid):
   # x [M,K]; wp/wg [K,P]; bp/bg [P]; mask [M].
   # split=False -> gated [M,P]; split=True -> (left [M,P/2], right [M,P/2]),
   # the two halves written contiguously so the caller needs no slice.
@@ -109,7 +111,7 @@ def gated_dual_proj(x, wp, bp, wg, bg, mask, *, block_m=64, split=False,
     )(x, wpl, bpl, wgl, bgl, wpr, bpr, wgr, bgr, mask)
     return left[:M], right[:M]
   out = pl.pallas_call(
-      _gdp_kernel,
+      functools.partial(_gdp_kernel, activation=activation),
       grid=(Mp // block_m,), in_specs=in_specs,
       out_specs=pl.BlockSpec((block_m, P), lambda i: (i, 0)),
       out_shape=jax.ShapeDtypeStruct((Mp, P), x.dtype),
