@@ -87,21 +87,32 @@ def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, o_ref, *,
 
 
 @functools.partial(jax.jit, static_argnames=(
-    "sm_scale", "block_q", "block_k", "num_warps", "num_stages"))
+    "sm_scale", "block_q", "block_k", "num_warps", "num_stages", "seq_major"))
 def tri_flash(q, k, v, bias, kmask, *, sm_scale, block_q=64, block_k=64,
-              num_warps=4, num_stages=2):
-  # q/k/v [N,H,Sq,D]; bias [H,Sq,Sk]; kmask [N,Sk] bool. No padding: Sq/Sk need
-  # not be block multiples; the kernel masks the partial q-block (output) and the
-  # partial k-block (loads), so the big q/k/v tensors are never copied.
-  N, H, Sq, D = q.shape
-  Sk = k.shape[2]
+              num_warps=4, num_stages=2, seq_major=False):
+  # q/k/v [N,H,Sq,D], or [N,Sq,H,D] when seq_major; bias [H,Sq,Sk]; kmask [N,Sk]
+  # bool. No padding: Sq/Sk need not be block multiples; the kernel masks the
+  # partial q-block (output) and the partial k-block (loads), so the big q/k/v
+  # tensors are never copied.
+  if seq_major:
+    N, Sq, H, D = q.shape
+    Sk = k.shape[1]
+  else:
+    N, H, Sq, D = q.shape
+    Sk = k.shape[2]
   chunks = _chunks(D)
   dk = chunks[-1][0] + chunks[-1][1]           # the tile the chunks span
   # grid (q_block, head, row): row N is innermost so the shared bias[h,q_block,:]
   # stays hot in L2 while sweeping rows (the bias is re-read for every row).
   grid = (pl.cdiv(Sq, block_q), H, N)
-  bs_qo = pl.BlockSpec((None, None, block_q, dk), lambda i, h, j: (j, h, i, 0))
-  bs_kv = pl.BlockSpec((None, None, Sk, dk),      lambda i, h, j: (j, h, 0, 0))
+  if seq_major:
+    bs_qo = pl.BlockSpec((None, block_q, None, dk), lambda i, h, j: (j, i, h, 0))
+    bs_kv = pl.BlockSpec((None, Sk, None, dk),      lambda i, h, j: (j, 0, h, 0))
+    out_shape = jax.ShapeDtypeStruct((N, Sq, H, D), q.dtype)
+  else:
+    bs_qo = pl.BlockSpec((None, None, block_q, dk), lambda i, h, j: (j, h, i, 0))
+    bs_kv = pl.BlockSpec((None, None, Sk, dk),      lambda i, h, j: (j, h, 0, 0))
+    out_shape = jax.ShapeDtypeStruct((N, H, Sq, D), q.dtype)
   bs_bias = pl.BlockSpec((None, block_q, Sk),    lambda i, h, j: (h, i, 0))
   bs_mask = pl.BlockSpec((None, Sk),             lambda i, h, j: (j, 0))
   return pl.pallas_call(
@@ -110,20 +121,26 @@ def tri_flash(q, k, v, bias, kmask, *, sm_scale, block_q=64, block_k=64,
       grid=grid,
       in_specs=[bs_qo, bs_kv, bs_kv, bs_bias, bs_mask],
       out_specs=bs_qo,
-      out_shape=jax.ShapeDtypeStruct((N, H, Sq, D), q.dtype),
+      out_shape=out_shape,
       compiler_params=plgpu.CompilerParams(num_warps=num_warps, num_stages=num_stages),
       name="tri_flash_fwd",
   )(q, k, v, bias, kmask)
 
 
-def pallas_attention(q, k, v, mask_bias, nonbatched_bias, scale):
+def pallas_attention(q, k, v, mask_bias, nonbatched_bias, scale, *, seq_major=False):
   """AF2 attention via the Pallas flash kernel.
 
-  q/k/v heads-major [b, h, S, c]; mask_bias additive [b,1,1,S_kv] (~-1e9 = invalid);
-  nonbatched_bias [h,S_qo,S_kv] shared, or None. Returns [b, h, S_qo, c].
+  q/k/v heads-major [b, h, S, c], or seq-major [b, S, h, c] when seq_major.
+  mask_bias additive [b,1,1,S_kv] (~-1e9 = invalid); nonbatched_bias
+  [h,S_qo,S_kv] shared, or None.
+  Returns q's layout.
   """
-  b, h, sq, c = q.shape
-  sk = k.shape[2]
+  if seq_major:
+    b, sq, h, c = q.shape
+    sk = k.shape[1]
+  else:
+    b, h, sq, c = q.shape
+    sk = k.shape[2]
   # The kernel reuses q's channel dim for v (one BlockSpec), so key_dim must equal value_dim
   # True for AF2's attention
   assert q.shape[-1] == v.shape[-1], (
@@ -137,7 +154,7 @@ def pallas_attention(q, k, v, mask_bias, nonbatched_bias, scale):
   block_k = _pow2_tile(min(64, c))
   # a head dim that is not a power of two, or below 16, is tiled wider and masked
   out = tri_flash(q, k, v, bias, kmask, sm_scale=float(scale),
-                  block_q=64, block_k=block_k)
+                  block_q=64, block_k=block_k, seq_major=seq_major)
   return out.astype(q.dtype)
 
 

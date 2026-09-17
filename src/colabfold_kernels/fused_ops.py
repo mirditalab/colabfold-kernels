@@ -14,13 +14,16 @@ def _volta():
   return volta
 
 
-def attention(global_config, dtype, key_dim, value_dim):
-  """-> f(q, k, v, mask_bias, nonbatched_bias, scale) or None."""
+def attention(global_config, dtype, key_dim, value_dim, layout='heads'):
+  """-> f(q, k, v, mask_bias, nonbatched_bias, scale) or None.
+
+  layout 'heads' takes q/k/v as [b, h, S, c], 'seq' as [b, S, h, c].
+  """
   import jax.numpy as jnp
   if not global_config.get('use_pallas', False):
     return None
   cc = _legacy_cc(global_config)
-  if dtype == jnp.float16 and cc is not None:
+  if dtype == jnp.float16 and cc is not None and layout == 'heads':
     va = _volta()
     # The kernels only handle a fixed set of head dims, and need key == value.
     if (va.available(cc) and key_dim == value_dim
@@ -29,6 +32,8 @@ def attention(global_config, dtype, key_dim, value_dim):
   if (global_config.get('kernel_backend', 'pallas') == 'pallas'
       and dtype in (jnp.bfloat16, jnp.float16)):
     from colabfold_kernels.tri_flash import pallas_attention
+    if layout == 'seq':
+      return functools.partial(pallas_attention, seq_major=True)
     return pallas_attention
   return None
 
