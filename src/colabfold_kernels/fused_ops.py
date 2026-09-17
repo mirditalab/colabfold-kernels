@@ -44,7 +44,7 @@ def layer_norm(global_config, dtype):
     if va.ops_available(cc):
       return va.volta_layer_norm
   if (global_config.get('kernel_backend', 'pallas') == 'pallas'
-      and dtype == jnp.bfloat16):
+      and dtype in (jnp.bfloat16, jnp.float32)):
     from colabfold_kernels.tri_mul import pallas_layer_norm
     return pallas_layer_norm
   return None

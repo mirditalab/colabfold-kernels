@@ -129,31 +129,51 @@ def ref_gdp(x, wp, bp, wg, bg, mask):
 # Fused LayerNorm: bf16 in/out, fp32 internal. One kernel replaces the
 # bf16->fp32 upcast + layernorm + fp32->bf16 downcast (kills the convert ops
 # and never materializes the fp32 tensor), while keeping fp32 accuracy.
-def _ln_kernel(x_ref, scale_ref, offset_ref, o_ref, *, eps, m, block_m):
-  valid = (pl.program_id(0) * block_m + jnp.arange(block_m)) < m   # [block_m]
-  x = plgpu.load(x_ref, mask=valid[:, None], other=0.0).astype(jnp.float32)
-  mean = jnp.mean(x, axis=-1, keepdims=True)
-  d = x - mean
-  var = jnp.mean(d * d, axis=-1, keepdims=True)
+def _ln_kernel(x_ref, scale_ref, offset_ref, o_ref, *, eps, m, c, block_m):
+  bc = x_ref.shape[-1]
+  rows = (pl.program_id(0) * block_m + jnp.arange(block_m)) < m     # [block_m]
+  if bc == c:
+    x = plgpu.load(x_ref, mask=rows[:, None], other=0.0).astype(jnp.float32)
+    mean = jnp.mean(x, axis=-1, keepdims=True)
+    d = x - mean
+    var = jnp.mean(d * d, axis=-1, keepdims=True)
+    scale, offset = scale_ref[...], offset_ref[...]
+    valid = rows[:, None]
+  else:
+    # c is not a power of two: tile to the next one, mask the lanes past c
+    cols = jnp.arange(bc) < c
+    valid = rows[:, None] & cols[None, :]
+    x = plgpu.load(x_ref, mask=valid, other=0.0).astype(jnp.float32)
+    mean = jnp.sum(x, axis=-1, keepdims=True) / c
+    d = jnp.where(cols[None, :], x - mean, 0.0)
+    var = jnp.sum(d * d, axis=-1, keepdims=True) / c
+    scale = plgpu.load(scale_ref, mask=cols, other=0.0)
+    offset = plgpu.load(offset_ref, mask=cols, other=0.0)
   y = d * jax.lax.rsqrt(var + eps)
-  y = y * scale_ref[...][None, :].astype(jnp.float32) + \
-      offset_ref[...][None, :].astype(jnp.float32)
-  plgpu.store(o_ref, y.astype(o_ref.dtype), mask=valid[:, None])
+  y = y * scale[None, :].astype(jnp.float32) + offset[None, :].astype(jnp.float32)
+  plgpu.store(o_ref, y.astype(o_ref.dtype), mask=valid)
+
+
+# a tile and its output both sit in shared memory
+_TILE_BYTES = 32 * 1024
 
 
 @functools.partial(jax.jit, static_argnames=("eps", "block_m"))
 def pallas_layer_norm(x, scale, offset, *, eps=1e-5, block_m=64):
   # x [..., c]; normalize over last axis; scale/offset [c]. Returns x's shape/dtype.
   c = x.shape[-1]
+  bc = max(16, 1 << (c - 1).bit_length())        # Triton tiles are powers of two
   xf = x.reshape(-1, c)
   m = xf.shape[0]
+  rows = max(1, _TILE_BYTES // (bc * x.dtype.itemsize))
+  block_m = min(block_m, 1 << (rows.bit_length() - 1))
   out = pl.pallas_call(
-      functools.partial(_ln_kernel, eps=eps, m=m, block_m=block_m),
+      functools.partial(_ln_kernel, eps=eps, m=m, c=c, block_m=block_m),
       grid=(pl.cdiv(m, block_m),),
-      in_specs=[pl.BlockSpec((block_m, c), lambda i: (i, 0)),
-                pl.BlockSpec((c,), lambda i: (0,)),
-                pl.BlockSpec((c,), lambda i: (0,))],
-      out_specs=pl.BlockSpec((block_m, c), lambda i: (i, 0)),
+      in_specs=[pl.BlockSpec((block_m, bc), lambda i: (i, 0)),
+                pl.BlockSpec((bc,), lambda i: (0,)),
+                pl.BlockSpec((bc,), lambda i: (0,))],
+      out_specs=pl.BlockSpec((block_m, bc), lambda i: (i, 0)),
       out_shape=jax.ShapeDtypeStruct((m, c), x.dtype),
       compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=2),
       name="pallas_layer_norm",
