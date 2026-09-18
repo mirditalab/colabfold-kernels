@@ -18,11 +18,17 @@ from jax.experimental.pallas import triton as plgpu
 _dot = functools.partial(jnp.dot, preferred_element_type=jnp.float32)
 
 
-def _gdp_kernel(x_ref, wp_ref, bp_ref, wg_ref, bg_ref, mask_ref, o_ref, *,
-                activation=jax.nn.sigmoid):
-  x = x_ref[...]                                      # [BM, K] bf16
-  proj = _dot(x, wp_ref[...]) + bp_ref[...][None, :].astype(jnp.float32)
-  gate = _dot(x, wg_ref[...]) + bg_ref[...][None, :].astype(jnp.float32)
+def _gdp_kernel_tiled(x_ref, wp_ref, bp_ref, wg_ref, bg_ref, mask_ref, o_ref, *,
+                      activation, block_k):
+  # one [BM, BN] output tile; looping over K lets Triton pipeline the loads
+  def body(k, acc):
+    ks = pl.ds(pl.multiple_of(k * block_k, block_k), block_k)
+    x = x_ref[:, ks]
+    return acc[0] + _dot(x, wp_ref[ks, :]), acc[1] + _dot(x, wg_ref[ks, :])
+  zero = jnp.zeros((x_ref.shape[0], wp_ref.shape[1]), jnp.float32)
+  proj, gate = jax.lax.fori_loop(0, x_ref.shape[1] // block_k, body, (zero, zero))
+  proj += bp_ref[...][None, :].astype(jnp.float32)
+  gate += bg_ref[...][None, :].astype(jnp.float32)
   o = mask_ref[...][:, None].astype(jnp.float32) * proj * activation(gate)
   o_ref[...] = o.astype(o_ref.dtype)
 
@@ -60,6 +66,35 @@ def _gdp_kernel_split(x_ref, wpl_ref, bpl_ref, wgl_ref, bgl_ref,
                       m).astype(or_ref.dtype)
 
 
+def _gdp_tiled(x, wp, bp, wg, bg, mask, activation):
+  M, K = x.shape
+  P = wp.shape[1]
+  block_k = 32 if K % 32 == 0 else K
+  block_n = 64 if P % 64 == 0 else 32 if P % 32 == 0 else P
+  block_m = 128
+  Mp = -(-M // block_m) * block_m
+  x = jnp.pad(x, [(0, Mp - M), (0, 0)])
+  mask = jnp.pad(mask, [(0, Mp - M)])
+  # column tiles outermost, so the row tiles sharing an x block run together
+  out = pl.pallas_call(
+      functools.partial(_gdp_kernel_tiled, activation=activation, block_k=block_k),
+      grid=(P // block_n, Mp // block_m),
+      in_specs=[
+          pl.BlockSpec((block_m, K), lambda j, i: (i, 0)),
+          pl.BlockSpec((K, block_n), lambda j, i: (0, j)),
+          pl.BlockSpec((block_n,), lambda j, i: (j,)),
+          pl.BlockSpec((K, block_n), lambda j, i: (0, j)),
+          pl.BlockSpec((block_n,), lambda j, i: (j,)),
+          pl.BlockSpec((block_m,), lambda j, i: (i,)),
+      ],
+      out_specs=pl.BlockSpec((block_m, block_n), lambda j, i: (i, j)),
+      out_shape=jax.ShapeDtypeStruct((Mp, P), x.dtype),
+      compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=4),
+      name="gated_dual_proj",
+  )(x, wp, bp, wg, bg, mask)
+  return out[:M]
+
+
 @functools.partial(jax.jit,
                    static_argnames=("block_m", "split", "channel_major", "activation"))
 def gated_dual_proj(x, wp, bp, wg, bg, mask, *, block_m=64, split=False,
@@ -67,57 +102,43 @@ def gated_dual_proj(x, wp, bp, wg, bg, mask, *, block_m=64, split=False,
   # x [M,K]; wp/wg [K,P]; bp/bg [P]; mask [M].
   # split=False -> gated [M,P]; split=True -> (left [M,P/2], right [M,P/2]),
   # the two halves written contiguously so the caller needs no slice.
+  if not split:
+    return _gdp_tiled(x, wp, bp, wg, bg, mask, activation)
   M, K = x.shape
   P = wp.shape[1]
   Mp = -(-M // block_m) * block_m
   x = jnp.pad(x, [(0, Mp - M), (0, 0)])
   mask = jnp.pad(mask, [(0, Mp - M)])
-  in_specs = [
-      pl.BlockSpec((block_m, K), lambda i: (i, 0)),
-      pl.BlockSpec((K, P), lambda i: (0, 0)),
-      pl.BlockSpec((P,), lambda i: (0,)),
-      pl.BlockSpec((K, P), lambda i: (0, 0)),
-      pl.BlockSpec((P,), lambda i: (0,)),
-      pl.BlockSpec((block_m,), lambda i: (i,)),
-  ]
+  xspec = pl.BlockSpec((block_m, K), lambda i: (i, 0))
+  mspec = pl.BlockSpec((block_m,), lambda i: (i,))
   cp = plgpu.CompilerParams(num_warps=4, num_stages=1)
-  if split:
-    ci = P // 2
-    wpl, wpr = wp[:, :ci], wp[:, ci:]
-    wgl, wgr = wg[:, :ci], wg[:, ci:]
-    bpl, bpr = bp[:ci], bp[ci:]
-    bgl, bgr = bg[:ci], bg[ci:]
-    wspec = pl.BlockSpec((K, ci), lambda i: (0, 0))
-    bspec = pl.BlockSpec((ci,), lambda i: (0,))
-    split_in = [in_specs[0], wspec, bspec, wspec, bspec, wspec, bspec,
-                wspec, bspec, in_specs[5]]
-    if channel_major:
-      bs = pl.BlockSpec((ci, block_m), lambda i: (0, i))
-      left, right = pl.pallas_call(
-          _gdp_kernel_split_cm,
-          grid=(Mp // block_m,), in_specs=split_in, out_specs=[bs, bs],
-          out_shape=[jax.ShapeDtypeStruct((ci, Mp), x.dtype),
-                     jax.ShapeDtypeStruct((ci, Mp), x.dtype)],
-          compiler_params=cp, name="gated_dual_proj_split_cm",
-      )(x, wpl, bpl, wgl, bgl, wpr, bpr, wgr, bgr, mask)
-      return left[:, :M], right[:, :M]
-    bs = pl.BlockSpec((block_m, ci), lambda i: (i, 0))
+  ci = P // 2
+  wpl, wpr = wp[:, :ci], wp[:, ci:]
+  wgl, wgr = wg[:, :ci], wg[:, ci:]
+  bpl, bpr = bp[:ci], bp[ci:]
+  bgl, bgr = bg[:ci], bg[ci:]
+  wspec = pl.BlockSpec((K, ci), lambda i: (0, 0))
+  bspec = pl.BlockSpec((ci,), lambda i: (0,))
+  split_in = [xspec, wspec, bspec, wspec, bspec, wspec, bspec, wspec, bspec, mspec]
+  if channel_major:
+    bs = pl.BlockSpec((ci, block_m), lambda i: (0, i))
     left, right = pl.pallas_call(
-        _gdp_kernel_split,
+        _gdp_kernel_split_cm,
         grid=(Mp // block_m,), in_specs=split_in, out_specs=[bs, bs],
-        out_shape=[jax.ShapeDtypeStruct((Mp, ci), x.dtype),
-                   jax.ShapeDtypeStruct((Mp, ci), x.dtype)],
-        compiler_params=cp, name="gated_dual_proj_split",
+        out_shape=[jax.ShapeDtypeStruct((ci, Mp), x.dtype),
+                   jax.ShapeDtypeStruct((ci, Mp), x.dtype)],
+        compiler_params=cp, name="gated_dual_proj_split_cm",
     )(x, wpl, bpl, wgl, bgl, wpr, bpr, wgr, bgr, mask)
-    return left[:M], right[:M]
-  out = pl.pallas_call(
-      functools.partial(_gdp_kernel, activation=activation),
-      grid=(Mp // block_m,), in_specs=in_specs,
-      out_specs=pl.BlockSpec((block_m, P), lambda i: (i, 0)),
-      out_shape=jax.ShapeDtypeStruct((Mp, P), x.dtype),
-      compiler_params=cp, name="gated_dual_proj",
-  )(x, wp, bp, wg, bg, mask)
-  return out[:M]
+    return left[:, :M], right[:, :M]
+  bs = pl.BlockSpec((block_m, ci), lambda i: (i, 0))
+  left, right = pl.pallas_call(
+      _gdp_kernel_split,
+      grid=(Mp // block_m,), in_specs=split_in, out_specs=[bs, bs],
+      out_shape=[jax.ShapeDtypeStruct((Mp, ci), x.dtype),
+                 jax.ShapeDtypeStruct((Mp, ci), x.dtype)],
+      compiler_params=cp, name="gated_dual_proj_split",
+  )(x, wpl, bpl, wgl, bgl, wpr, bpr, wgr, bgr, mask)
+  return left[:M], right[:M]
 
 
 def ref_gdp(x, wp, bp, wg, bg, mask):
