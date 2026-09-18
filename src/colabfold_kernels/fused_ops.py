@@ -55,18 +55,21 @@ def layer_norm(global_config, dtype):
   return None
 
 
-def gated_dual_proj(global_config, dtype):
-  """-> f(x, wp, bp, wg, bg, mask, *, split) or None."""
+def gated_dual_proj(global_config, dtype, activation=None):
+  """-> f(x, wp, bp, wg, bg, mask, *, split) or None. activation defaults to sigmoid."""
+  import jax
   import jax.numpy as jnp
   if not global_config.get('use_pallas', False):
     return None
   cc = _legacy_cc(global_config)
-  if dtype == jnp.float16 and cc is not None:
+  # the prebuilt kernels gate with a sigmoid and nothing else
+  if (dtype == jnp.float16 and cc is not None
+      and activation in (None, jax.nn.sigmoid)):
     va = _volta()
     if va.ops_available(cc):
       return functools.partial(va.volta_gated_dual_proj, cc=cc)
   if (global_config.get('kernel_backend', 'pallas') == 'pallas'
       and dtype in (jnp.bfloat16, jnp.float16)):
     from colabfold_kernels.tri_mul import gated_dual_proj as gdp
-    return gdp
+    return gdp if activation is None else functools.partial(gdp, activation=activation)
   return None

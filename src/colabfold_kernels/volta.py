@@ -149,7 +149,7 @@ def _gdp_call(x, wp, bp, wg, bg, mask, *, sym):
         x, wp, bp, wg, bg, mask)
 
 
-def volta_gated_dual_proj(x, wp, bp, wg, bg, mask, cc, *, split=True,
+def volta_gated_dual_proj(x, wp, bp, wg, bg, mask, cc, *, split=False,
                           channel_major=False):
     """Drop-in for tri_mul.gated_dual_proj. x [M,K]; wp/wg [K,P]; mask [M]."""
     sym = "VoltaGdp" if cc >= 75 else "VoltaGdpWmma"
