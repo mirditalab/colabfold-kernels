@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "colabfold-kernels"
+version = "0.1.0"
+description = "Fast fused kernels for ColabFold"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Milot Mirdita", email = "milot@mirdita.de" }]
+keywords = ["alphafold", "colabfold", "pallas", "triton", "jax", "attention", "bioinformatics"]
+classifiers = [
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+  "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+[project.urls]
+Homepage = "https://github.com/mirditalab/colabfold-kernels"
+Issues = "https://github.com/mirditalab/colabfold-kernels/issues"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]

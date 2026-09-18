@@ -1,0 +1,67 @@
+"""Pick the fused kernel (volta, Pallas, or None for XLA) for each op."""
+import functools
+
+
+def _legacy_cc(global_config):
+  """Give the compute capability if the CUDA kernels were asked for, else None."""
+  if global_config.get('kernel_backend', 'pallas') != 'cuda_legacy':
+    return None
+  return global_config.get('compute_capability')
+
+
+def _volta():
+  from colabfold_kernels import volta
+  return volta
+
+
+def attention(global_config, dtype, key_dim, value_dim):
+  """-> f(q, k, v, mask_bias, nonbatched_bias, scale) or None."""
+  import jax.numpy as jnp
+  if not global_config.get('use_pallas', False):
+    return None
+  cc = _legacy_cc(global_config)
+  if dtype == jnp.float16 and cc is not None:
+    va = _volta()
+    # The kernels only handle a fixed set of head dims, and need key == value.
+    if (va.available(cc) and key_dim == value_dim
+        and va.supports(int(key_dim), cc)):
+      return functools.partial(va.volta_attention, cc=cc)
+  if (global_config.get('kernel_backend', 'pallas') == 'pallas'
+      and dtype in (jnp.bfloat16, jnp.float16)):
+    from colabfold_kernels.tri_flash import pallas_attention
+    return pallas_attention
+  return None
+
+
+def layer_norm(global_config, dtype):
+  """-> f(x, scale, offset, *, eps) or None. Last-axis, scale+offset only."""
+  import jax.numpy as jnp
+  if not global_config.get('use_pallas', False):
+    return None
+  cc = _legacy_cc(global_config)
+  if dtype == jnp.float16 and cc is not None:
+    va = _volta()
+    if va.ops_available(cc):
+      return va.volta_layer_norm
+  if (global_config.get('kernel_backend', 'pallas') == 'pallas'
+      and dtype == jnp.bfloat16):
+    from colabfold_kernels.tri_mul import pallas_layer_norm
+    return pallas_layer_norm
+  return None
+
+
+def gated_dual_proj(global_config, dtype):
+  """-> f(x, wp, bp, wg, bg, mask, *, split) or None."""
+  import jax.numpy as jnp
+  if not global_config.get('use_pallas', False):
+    return None
+  cc = _legacy_cc(global_config)
+  if dtype == jnp.float16 and cc is not None:
+    va = _volta()
+    if va.ops_available(cc):
+      return functools.partial(va.volta_gated_dual_proj, cc=cc)
+  if (global_config.get('kernel_backend', 'pallas') == 'pallas'
+      and dtype in (jnp.bfloat16, jnp.float16)):
+    from colabfold_kernels.tri_mul import gated_dual_proj as gdp
+    return gdp
+  return None
