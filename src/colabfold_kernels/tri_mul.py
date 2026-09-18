@@ -154,7 +154,7 @@ def _ln_kernel(x_ref, scale_ref, offset_ref, o_ref, *, eps, m, c, block_m):
   plgpu.store(o_ref, y.astype(o_ref.dtype), mask=valid)
 
 
-# a tile and its output both sit in shared memory
+# Triton keeps the tile in registers, so a wider one only spills and compiles slower
 _TILE_BYTES = 32 * 1024
 
 
