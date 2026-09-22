@@ -65,13 +65,12 @@ def gated_dual_proj(global_config, dtype, activation=None):
   from colabfold_kernels.grads import differentiable_gated_dual_proj
   cc = _legacy_cc(global_config)
   act = jax.nn.sigmoid if activation is None else activation
-  # the prebuilt kernels gate with a sigmoid and nothing else
-  if (dtype == jnp.float16 and cc is not None
-      and activation in (None, jax.nn.sigmoid)):
+  if dtype == jnp.float16 and cc is not None:
     va = _volta()
-    if va.ops_available(cc):
+    # the prebuilt kernels gate with sigmoid or swish, nothing else
+    if act in va.GDP_ACTIVATIONS and va.ops_available(cc):
       return differentiable_gated_dual_proj(
-          functools.partial(va.volta_gated_dual_proj, cc=cc), act)
+          functools.partial(va.volta_gated_dual_proj, cc=cc, activation=act), act)
   if (global_config.get('kernel_backend', 'pallas') == 'pallas'
       and dtype in (jnp.bfloat16, jnp.float16)):
     from colabfold_kernels.tri_mul import gated_dual_proj as gdp

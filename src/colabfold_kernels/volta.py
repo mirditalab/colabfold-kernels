@@ -205,29 +205,37 @@ def volta_layer_norm(x, scale, offset, *, eps=1e-5):
     return out.reshape(x.shape).astype(x.dtype)
 
 
-@functools.partial(jax.jit, static_argnames=("sym",))
-def _gdp_call(x, wp, bp, wg, bg, mask, *, sym):
+# What the kernels gate with. jax.nn.swish is jax.nn.silu, one object.
+GDP_ACTIVATIONS = {jax.nn.sigmoid: 0, jax.nn.swish: 1}
+
+
+@functools.partial(jax.jit, static_argnames=("sym", "activation"))
+def _gdp_call(x, wp, bp, wg, bg, mask, *, sym, activation):
     m = x.shape[0]
     n = wp.shape[1]
     return jax.ffi.ffi_call(sym, jax.ShapeDtypeStruct((m, n), jnp.float16),
                             vmap_method="sequential")(
-        x, wp, bp, wg, bg, mask)
+        x, wp, bp, wg, bg, mask, activation=np.int64(activation))
 
 
 def volta_gated_dual_proj(x, wp, bp, wg, bg, mask, cc, *, split=False,
-                          channel_major=False):
+                          channel_major=False, activation=jax.nn.sigmoid):
     """Drop-in for tri_mul.gated_dual_proj. x [M,K]; wp/wg [K,P]; mask [M]."""
     sym = "VoltaGdp" if cc >= 75 else "VoltaGdpWmma"
+    if activation not in GDP_ACTIVATIONS:
+        raise ValueError("gated dual projection gates with sigmoid or swish, not %s"
+                         % getattr(activation, "__name__", activation))
+    act = GDP_ACTIVATIONS[activation]
     f16 = lambda t: t.astype(jnp.float16)
     if not split:
         return _gdp_call(f16(x), f16(wp), f16(bp), f16(wg), f16(bg),
-                         f16(mask), sym=sym).astype(x.dtype)
+                         f16(mask), sym=sym, activation=act).astype(x.dtype)
     ci = wp.shape[1] // 2
     halves = []
     for lo, hi in ((0, ci), (ci, 2 * ci)):
         halves.append(_gdp_call(f16(x), f16(wp[:, lo:hi]), f16(bp[lo:hi]),
                                 f16(wg[:, lo:hi]), f16(bg[lo:hi]), f16(mask),
-                                sym=sym).astype(x.dtype))
+                                sym=sym, activation=act).astype(x.dtype))
     if channel_major:
         # XLA would transpose row-major halves for the einsum anyway.
         halves = [h.T for h in halves]
