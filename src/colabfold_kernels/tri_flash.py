@@ -1,7 +1,5 @@
 """Pallas/Triton flash attention for the AF2 Evoformer (MSA + triangle).
 
-Inference (forward) only, no backward pass
-
 Computes, per (batch n, head h):
   softmax_k( scale * Q_q . K_k + bias_{h,q,k}  if mask_{n,k} else -inf ) . V_k
 Layout: q/k/v [N, H, S, D]; bias [H, Sq, Sk] (shared across N); kmask [N, Sk] bool.
@@ -35,8 +33,9 @@ def _chunks(d):
   return tuple(out) if off < tile else ((0, tile),)
 
 
-def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, o_ref, *,
+def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, o_ref, *rest,
             sm_scale, block_q, block_k, sq, d, chunks):
+  lse_ref = rest[0] if rest else None
   # q_ref [block_q, W]; k_ref/v_ref [Sk, W]; bias_ref [block_q, Sk]; kmask_ref [Sk],
   # W being d split into power-of-two dot widths. Sq/Sk are NOT padded to block
   # multiples; boundary blocks are handled with masked loads (offs < Sk) and a
@@ -80,6 +79,9 @@ def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, o_ref, *,
 
   os, m_i, l_i = jax.lax.fori_loop(0, pl.cdiv(sk, block_k), body, (os, m_i, l_i))
   q_valid = (pl.program_id(0) * block_q + jnp.arange(block_q)) < sq
+  if lse_ref is not None:
+    # log2 domain, which is what the backward's exp2 wants
+    plgpu.store(lse_ref, m_i + jnp.log2(l_i), mask=q_valid)
   for oc, (off, w), c in zip(os, chunks, cols):
     m = q_valid[:, None] if c is None else q_valid[:, None] & c[None, :]
     plgpu.store(o_ref.at[:, pl.dslice(off, w)],
@@ -87,9 +89,10 @@ def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, o_ref, *,
 
 
 @functools.partial(jax.jit, static_argnames=(
-    "sm_scale", "block_q", "block_k", "num_warps", "num_stages", "seq_major"))
+    "sm_scale", "block_q", "block_k", "num_warps", "num_stages", "seq_major",
+    "want_lse"))
 def tri_flash(q, k, v, bias, kmask, *, sm_scale, block_q=64, block_k=64,
-              num_warps=4, num_stages=2, seq_major=False):
+              num_warps=4, num_stages=2, seq_major=False, want_lse=False):
   # q/k/v [N,H,Sq,D], or [N,Sq,H,D] when seq_major; bias [H,Sq,Sk]; kmask [N,Sk]
   # bool. No padding: Sq/Sk need not be block multiples; the kernel masks the
   # partial q-block (output) and the partial k-block (loads), so the big q/k/v
@@ -115,16 +118,175 @@ def tri_flash(q, k, v, bias, kmask, *, sm_scale, block_q=64, block_k=64,
     out_shape = jax.ShapeDtypeStruct((N, H, Sq, D), q.dtype)
   bs_bias = pl.BlockSpec((None, block_q, Sk),    lambda i, h, j: (h, i, 0))
   bs_mask = pl.BlockSpec((None, Sk),             lambda i, h, j: (j, 0))
+  # lse is [N, H, Sq] whatever q's layout, since only the backward reads it
+  bs_lse = pl.BlockSpec((None, None, block_q), lambda i, h, j: (j, h, i))
+  out_specs = bs_qo if not want_lse else [bs_qo, bs_lse]
+  if want_lse:
+    out_shape = [out_shape, jax.ShapeDtypeStruct((N, H, Sq), jnp.float32)]
   return pl.pallas_call(
       functools.partial(_kernel, sm_scale=sm_scale, block_q=block_q,
                         block_k=block_k, sq=Sq, d=D, chunks=chunks),
       grid=grid,
       in_specs=[bs_qo, bs_kv, bs_kv, bs_bias, bs_mask],
-      out_specs=bs_qo,
+      out_specs=out_specs,
       out_shape=out_shape,
       compiler_params=plgpu.CompilerParams(num_warps=num_warps, num_stages=num_stages),
       name="tri_flash_fwd",
   )(q, k, v, bias, kmask)
+
+
+def _bwd_kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, do_ref, lse_ref, delta_ref,
+                _zq_ref, _zb_ref, dq_ref, dk_ref, dv_ref, dbias_ref, *,
+                sm_scale, block_q, block_k, sq, sk, d, chunks):
+  # One k block per program, sweeping q: dK/dV accumulate in registers, while dQ
+  # and dBias land from every k block and so go through atomics. The head dim is
+  # split the way the forward splits it, so only the widest chunk has to fit.
+  start_k = pl.program_id(0) * block_k
+  offs_k = start_k + jnp.arange(block_k)
+  kb = offs_k < sk
+  ks = pl.dslice(start_k, block_k)
+  cols = [None if off + w <= d else (off + jnp.arange(w)) < d for off, w in chunks]
+  # full 2d masks: a load broadcasts a [rows, 1] mask, an atomic does not
+  kvm = [jnp.broadcast_to(kb[:, None], (block_k, w)) if c is None
+         else kb[:, None] & c[None, :] for (_, w), c in zip(chunks, cols)]
+  kcs = [plgpu.load(k_ref.at[ks, pl.dslice(off, w)], mask=m, other=0.0)
+         for (off, w), m in zip(chunks, kvm)]
+  vcs = [plgpu.load(v_ref.at[ks, pl.dslice(off, w)], mask=m, other=0.0)
+         for (off, w), m in zip(chunks, kvm)]
+  km = plgpu.load(kmask_ref.at[ks], mask=kb, other=False)
+
+  def body(i, carry):
+    dk_acc, dv_acc = carry
+    start_q = i * block_q
+    offs_q = start_q + jnp.arange(block_q)
+    qb = offs_q < sq
+    qs = pl.dslice(start_q, block_q)
+    qm = [jnp.broadcast_to(qb[:, None], (block_q, w)) if c is None
+          else qb[:, None] & c[None, :] for (_, w), c in zip(chunks, cols)]
+    qcs = [plgpu.load(q_ref.at[qs, pl.dslice(off, w)], mask=m, other=0.0)
+           for (off, w), m in zip(chunks, qm)]
+    docs = [plgpu.load(do_ref.at[qs, pl.dslice(off, w)], mask=m, other=0.0)
+            for (off, w), m in zip(chunks, qm)]
+    lse = plgpu.load(lse_ref.at[qs], mask=qb, other=0.0)
+    delta = plgpu.load(delta_ref.at[qs], mask=qb, other=0.0)
+    bias = plgpu.load(bias_ref.at[qs, ks], mask=qb[:, None] & kb[None, :], other=0.0)
+
+    qk = None
+    dp = None
+    for qc, kc, doc, vc in zip(qcs, kcs, docs, vcs):
+      part = _dot(qc, kc.T)
+      qk = part if qk is None else qk + part
+      part = _dot(doc, vc.T)
+      dp = part if dp is None else dp + part
+    live = qb[:, None] & (km & kb)[None, :]
+    # the clamp the forward used, so an all-masked row differentiates the
+    # uniform softmax it was given
+    s = jnp.where(live, (qk * sm_scale + bias) * LOG2E, NEG)
+    p = jnp.exp2(s - lse[:, None])
+    # a masked logit is a constant, thus nothing flows back through it
+    ds = jnp.where(live, p * (dp - delta[:, None]), 0.0)
+
+    dk_next, dv_next = [], []
+    for j, (qc, doc) in enumerate(zip(qcs, docs)):
+      dv_next.append(dv_acc[j] + _dot(p.astype(doc.dtype).T, doc))
+      dk_next.append(dk_acc[j] + _dot(ds.astype(qc.dtype).T, qc))
+    for (off, w), kc, m in zip(chunks, kcs, qm):
+      plgpu.atomic_add(dq_ref, (qs, pl.dslice(off, w)),
+                       (_dot(ds.astype(kc.dtype), kc) * sm_scale).astype(dq_ref.dtype),
+                       mask=m)
+    plgpu.atomic_add(dbias_ref, (qs, ks), ds.astype(dbias_ref.dtype),
+                     mask=qb[:, None] & kb[None, :])
+    return dk_next, dv_next
+
+  zero = [jnp.zeros((block_k, w), jnp.float32) for _, w in chunks]
+  dk_acc, dv_acc = jax.lax.fori_loop(0, pl.cdiv(sq, block_q), body, (zero, zero))
+  for (off, w), dkc, dvc, m in zip(chunks, dk_acc, dv_acc, kvm):
+    plgpu.store(dk_ref.at[ks, pl.dslice(off, w)],
+                (dkc * sm_scale).astype(dk_ref.dtype), mask=m)
+    plgpu.store(dv_ref.at[ks, pl.dslice(off, w)], dvc.astype(dv_ref.dtype), mask=m)
+
+
+@functools.partial(jax.jit, static_argnames=(
+    "sm_scale", "block_q", "block_k", "num_warps", "num_stages", "seq_major"))
+def tri_flash_bwd(q, k, v, bias, kmask, out, dout, lse, *, sm_scale,
+                  block_q=64, block_k=64, num_warps=4, num_stages=2,
+                  seq_major=False):
+  """dQ, dK, dV and dBias. lse comes from the forward with want_lse."""
+  if seq_major:
+    N, Sq, H, D = q.shape
+    Sk = k.shape[1]
+  else:
+    N, H, Sq, D = q.shape
+    Sk = k.shape[2]
+  chunks = _chunks(D)
+  tile = chunks[-1][0] + chunks[-1][1]
+  # the row statistic, cheap enough in xla and fused into the surrounding graph
+  delta = jnp.sum(out.astype(jnp.float32) * dout.astype(jnp.float32), axis=-1)
+  if seq_major:
+    delta = delta.transpose(0, 2, 1)          # [N, H, Sq] like lse
+  # grid (k block, head, row): row innermost keeps bias and dbias hot, as in the
+  # forward, and dbias is shared across rows so its atomics want that most.
+  grid = (pl.cdiv(Sk, block_k), H, N)
+  if seq_major:
+    bs_q = pl.BlockSpec((None, Sq, None, tile), lambda i, h, j: (j, 0, h, 0))
+    bs_k = pl.BlockSpec((None, Sk, None, tile), lambda i, h, j: (j, 0, h, 0))
+  else:
+    bs_q = pl.BlockSpec((None, None, Sq, tile), lambda i, h, j: (j, h, 0, 0))
+    bs_k = pl.BlockSpec((None, None, Sk, tile), lambda i, h, j: (j, h, 0, 0))
+  bs_bias = pl.BlockSpec((None, Sq, Sk), lambda i, h, j: (h, 0, 0))
+  bs_mask = pl.BlockSpec((None, Sk), lambda i, h, j: (j, 0))
+  bs_row = pl.BlockSpec((None, None, Sq), lambda i, h, j: (j, h, 0))
+  zeros_q = jnp.zeros(q.shape, jnp.float32)
+  zeros_b = jnp.zeros((H, Sq, Sk), jnp.float32)
+  dq, dk, dv, dbias = pl.pallas_call(
+      functools.partial(_bwd_kernel, sm_scale=sm_scale, block_q=block_q,
+                        block_k=block_k, sq=Sq, sk=Sk, d=D, chunks=chunks),
+      grid=grid,
+      in_specs=[bs_q, bs_k, bs_k, bs_bias, bs_mask, bs_q, bs_row, bs_row,
+                bs_q, bs_bias],
+      out_specs=[bs_q, bs_k, bs_k, bs_bias],
+      out_shape=[jax.ShapeDtypeStruct(q.shape, jnp.float32),
+                 jax.ShapeDtypeStruct(k.shape, k.dtype),
+                 jax.ShapeDtypeStruct(v.shape, v.dtype),
+                 jax.ShapeDtypeStruct((H, Sq, Sk), jnp.float32)],
+      # dq and dbias accumulate, thus they start at zero and alias their input
+      input_output_aliases={8: 0, 9: 3},
+      compiler_params=plgpu.CompilerParams(num_warps=num_warps, num_stages=num_stages),
+      name="tri_flash_bwd",
+  )(q, k, v, bias, kmask, dout, lse, delta, zeros_q, zeros_b)
+  return dq.astype(q.dtype), dk, dv, dbias
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6))
+def _attn_diff(q, k, v, bias, kmask, sm_scale, seq_major):
+  block_k = _pow2_tile(min(64, q.shape[-1]))
+  return tri_flash(q, k, v, bias, kmask, sm_scale=sm_scale, block_q=64,
+                   block_k=block_k, seq_major=seq_major)
+
+
+def _attn_diff_fwd(q, k, v, bias, kmask, sm_scale, seq_major):
+  block_k = _pow2_tile(min(64, q.shape[-1]))
+  out, lse = tri_flash(q, k, v, bias, kmask, sm_scale=sm_scale, block_q=64,
+                       block_k=block_k, seq_major=seq_major, want_lse=True)
+  return out, (q, k, v, bias, kmask, out, lse)
+
+
+def _attn_diff_bwd(sm_scale, seq_major, res, dout):
+  q, k, v, bias, kmask, out, lse = res
+  d = q.shape[-1]
+  # The backward holds q, dO, K and V at once where the forward holds two of
+  # them, so a wide head needs a shorter block to stay inside shared memory.
+  block_q = 32 if d > 64 else 64
+  block_k = min(block_q, _pow2_tile(min(64, d)))
+  dq, dk, dv, dbias = tri_flash_bwd(q, k, v, bias, kmask, out, dout, lse,
+                                    sm_scale=sm_scale, block_q=block_q,
+                                    block_k=block_k, seq_major=seq_major)
+  # kmask is boolean, thus its cotangent is the empty float0
+  return (dq, dk, dv, dbias.astype(bias.dtype),
+          jnp.zeros(kmask.shape, jax.dtypes.float0))
+
+
+_attn_diff.defvjp(_attn_diff_fwd, _attn_diff_bwd)
 
 
 def pallas_attention(q, k, v, mask_bias, nonbatched_bias, scale, *, seq_major=False):
@@ -151,10 +313,8 @@ def pallas_attention(q, k, v, mask_bias, nonbatched_bias, scale, *, seq_major=Fa
   bias = (jnp.zeros((h, sq, sk), q.dtype)
           if nonbatched_bias is None else nonbatched_bias.astype(q.dtype))
   # Key tile matches the head: a wider tile stages smem the kernel never reads.
-  block_k = _pow2_tile(min(64, c))
-  # a head dim that is not a power of two, or below 16, is tiled wider and masked
-  out = tri_flash(q, k, v, bias, kmask, sm_scale=float(scale),
-                  block_q=64, block_k=block_k, seq_major=seq_major)
+  # A head dim that is not a power of two, or below 16, is tiled wider and masked.
+  out = _attn_diff(q, k, v, bias, kmask, float(scale), seq_major)
   return out.astype(q.dtype)
 
 
