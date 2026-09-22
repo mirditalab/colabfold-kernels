@@ -8,8 +8,10 @@ import jax.numpy as jnp
 import numpy as np
 
 # Head dims each kernel instantiates: mma.sync (sm_75+) and wmma (sm_70).
-_HEAD_DIMS_MMA = (8, 16, 32, 64)
-_HEAD_DIMS_WMMA = (8, 16, 32, 64)
+# 24/48/96 are af3's: single 384/16, diffusion token 768/16, protenix2's 96.
+# wmma has no 24 because its fragment is 16 wide, so 24 pads to 32.
+_HEAD_DIMS_MMA = (8, 16, 24, 32, 48, 64, 96)
+_HEAD_DIMS_WMMA = (8, 16, 32, 48, 64, 96)
 
 _LOADED = {}
 
@@ -48,6 +50,16 @@ def _attn_symbol(cc):
     return "VoltaMma" if cc >= 75 else "VoltaWmma"
 
 
+def _attn_bwd_symbol(cc):
+    return "VoltaMmaBwd" if cc >= 75 else "VoltaWmmaBwd"
+
+
+def bwd_available(cc):
+    """True if the backward library for this device loads. Wheels before 0.3.0
+    carry no backward, so a caller that wants gradients has to ask."""
+    return _load("attention_bwd", cc, (_attn_bwd_symbol(cc),))
+
+
 def available(cc):
     """True if the attention library for this device loads."""
     return _load("attention", cc, (_attn_symbol(cc),))
@@ -83,20 +95,73 @@ def ops_available(cc):
     return ok
 
 
-@functools.partial(jax.jit, static_argnames=("sym", "sm_scale", "block_q", "block_k"))
-def _attn_call(q, k, v, bias, kmask, *, sym, sm_scale, block_q, block_k):
+@functools.partial(jax.jit,
+                   static_argnames=("sym", "sm_scale", "block_q", "block_k", "want_lse"))
+def _attn_call(q, k, v, bias, kmask, *, sym, sm_scale, block_q, block_k, want_lse):
     n, h, sq, d = q.shape
+    # lse is the softmax statistic the backward rebuilds P from. Inference does
+    # not want it, and the kernel then leaves the buffer alone, so ask for one
+    # element rather than [n, h, sq].
+    lse_shape = (n, h, sq) if want_lse else (1,)
     # sequential: the template stack vmaps over templates, and the handlers take a fixed rank.
-    return jax.ffi.ffi_call(sym, jax.ShapeDtypeStruct((n, h, sq, d), jnp.float16),
-                            vmap_method="sequential")(
+    out, lse = jax.ffi.ffi_call(sym, (jax.ShapeDtypeStruct((n, h, sq, d), jnp.float16),
+                                      jax.ShapeDtypeStruct(lse_shape, jnp.float32)),
+                                vmap_method="sequential")(
         q, k, v, bias, kmask,
         scale=np.float32(sm_scale),
-        block_q=np.int64(block_q), block_k=np.int64(block_k))
+        block_q=np.int64(block_q), block_k=np.int64(block_k), want_lse=want_lse)
+    return (out, lse) if want_lse else out
+
+
+@functools.partial(jax.jit, static_argnames=("sym", "sm_scale", "want_dbias"))
+def _attn_bwd_call(q, k, v, bias, kmask, out, dout, lse, *, sym, sm_scale, want_dbias):
+    """dQ/dK/dV and, when asked, dBias. The kernel takes out, not the row
+    statistic, and makes that itself."""
+    n, h, sq, d = q.shape
+    sk = k.shape[2]
+    return jax.ffi.ffi_call(sym, (jax.ShapeDtypeStruct(q.shape, jnp.float16),
+                                  jax.ShapeDtypeStruct(k.shape, jnp.float16),
+                                  jax.ShapeDtypeStruct(v.shape, jnp.float16),
+                                  jax.ShapeDtypeStruct((h, sq, sk), jnp.float32)),
+                            vmap_method="sequential")(
+        q, k, v, bias, kmask, out, dout, lse,
+        scale=np.float32(sm_scale), want_dbias=want_dbias)
+
+
+# The custom_vjp covers the kernel call only. Padding the head dim and slicing
+# the output are ordinary jnp ops, so their transposes come for free.
+@functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7, 8, 9))
+def _attn_diff(q, k, v, bias, kmask, sym, bwd_sym, sm_scale, block_q, block_k):
+    return _attn_call(q, k, v, bias, kmask, sym=sym, sm_scale=sm_scale,
+                      block_q=block_q, block_k=block_k, want_lse=False)
+
+
+def _attn_diff_fwd(q, k, v, bias, kmask, sym, bwd_sym, sm_scale, block_q, block_k):
+    out, lse = _attn_call(q, k, v, bias, kmask, sym=sym, sm_scale=sm_scale,
+                          block_q=block_q, block_k=block_k, want_lse=True)
+    return out, (q, k, v, bias, kmask, out, lse)
+
+
+def _attn_diff_bwd(sym, bwd_sym, sm_scale, block_q, block_k, res, dout):
+    q, k, v, bias, kmask, out, lse = res
+    dq, dk, dv, dbias = _attn_bwd_call(
+        q, k, v, bias, kmask, out, dout.astype(jnp.float16), lse,
+        sym=bwd_sym, sm_scale=sm_scale, want_dbias=True)
+    # kmask is integral, thus its cotangent is the empty float0.
+    return (dq, dk, dv, dbias.astype(bias.dtype),
+            jnp.zeros(kmask.shape, jax.dtypes.float0))
+
+
+_attn_diff.defvjp(_attn_diff_fwd, _attn_diff_bwd)
 
 
 def volta_attention(q, k, v, mask_bias, nonbatched_bias, scale, cc,
                     block_q=64, block_k=32):
-    """Drop-in for tri_flash.pallas_attention. q/k/v [b,h,S,c] float16."""
+    """Drop-in for tri_flash.pallas_attention. q/k/v [b,h,S,c] float16.
+
+    Differentiable where the wheel carries a backward; bwd_available(cc) says
+    whether it does, because one built before 0.3.0 does not.
+    """
     in_dtype = q.dtype
     b, h, sq, c = q.shape
     sk = k.shape[2]
@@ -114,10 +179,10 @@ def volta_attention(q, k, v, mask_bias, nonbatched_bias, scale, cc,
     kmask = jnp.broadcast_to(mask_bias[:, 0, 0, :] > -1e3, (b, sk)).astype(jnp.uint8)
     bias = (jnp.zeros((h, sq, sk), jnp.float16) if nonbatched_bias is None
             else nonbatched_bias.astype(jnp.float16))
-    out = _attn_call(q.astype(jnp.float16), k.astype(jnp.float16),
+    out = _attn_diff(q.astype(jnp.float16), k.astype(jnp.float16),
                      v.astype(jnp.float16), bias, kmask,
-                     sym=_attn_symbol(cc), sm_scale=float(scale),
-                     block_q=block_q, block_k=block_k)
+                     _attn_symbol(cc), _attn_bwd_symbol(cc), float(scale),
+                     block_q, block_k)
     if pad_to is not None:
         out = out[..., :c]
     return out.astype(in_dtype)
