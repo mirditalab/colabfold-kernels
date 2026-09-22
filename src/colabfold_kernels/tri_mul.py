@@ -33,27 +33,27 @@ def _gdp_kernel_tiled(x_ref, wp_ref, bp_ref, wg_ref, bg_ref, mask_ref, o_ref, *,
   o_ref[...] = o.astype(o_ref.dtype)
 
 
-def _half(x, wp, bp, wg, bg, mask):
+def _half(x, wp, bp, wg, bg, mask, activation):
   proj = _dot(x, wp) + bp[None, :].astype(jnp.float32)
   gate = _dot(x, wg) + bg[None, :].astype(jnp.float32)
-  return mask[:, None].astype(jnp.float32) * proj * jax.nn.sigmoid(gate)
+  return mask[:, None].astype(jnp.float32) * proj * activation(gate)
 
 
 def _gdp_kernel_split_cm(x_ref, wpl_ref, bpl_ref, wgl_ref, bgl_ref,
                          wpr_ref, bpr_ref, wgr_ref, bgr_ref, mask_ref,
-                         ol_ref, or_ref):
+                         ol_ref, or_ref, *, activation):
   # _gdp_kernel_split, stored channel-major [ci, BM] for the triangle einsum.
   x = x_ref[...]
   m = mask_ref[...]
   ol_ref[...] = _half(x, wpl_ref[...], bpl_ref[...], wgl_ref[...], bgl_ref[...],
-                      m).T.astype(ol_ref.dtype)
+                      m, activation).T.astype(ol_ref.dtype)
   or_ref[...] = _half(x, wpr_ref[...], bpr_ref[...], wgr_ref[...], bgr_ref[...],
-                      m).T.astype(or_ref.dtype)
+                      m, activation).T.astype(or_ref.dtype)
 
 
 def _gdp_kernel_split(x_ref, wpl_ref, bpl_ref, wgl_ref, bgl_ref,
                       wpr_ref, bpr_ref, wgr_ref, bgr_ref, mask_ref,
-                      ol_ref, or_ref):
+                      ol_ref, or_ref, *, activation):
   # Computes the left [BM, ci] and right [BM, ci] gated projections as two
   # separate dots (weights pre-split on the host) and writes them to two
   # contiguous outputs -- so the triangle einsum consumes them directly with no
@@ -61,9 +61,9 @@ def _gdp_kernel_split(x_ref, wpl_ref, bpl_ref, wgl_ref, bgl_ref,
   x = x_ref[...]
   m = mask_ref[...]
   ol_ref[...] = _half(x, wpl_ref[...], bpl_ref[...], wgl_ref[...], bgl_ref[...],
-                      m).astype(ol_ref.dtype)
+                      m, activation).astype(ol_ref.dtype)
   or_ref[...] = _half(x, wpr_ref[...], bpr_ref[...], wgr_ref[...], bgr_ref[...],
-                      m).astype(or_ref.dtype)
+                      m, activation).astype(or_ref.dtype)
 
 
 def _gdp_tiled(x, wp, bp, wg, bg, mask, activation):
@@ -123,7 +123,7 @@ def gated_dual_proj(x, wp, bp, wg, bg, mask, *, block_m=64, split=False,
   if channel_major:
     bs = pl.BlockSpec((ci, block_m), lambda i: (0, i))
     left, right = pl.pallas_call(
-        _gdp_kernel_split_cm,
+        functools.partial(_gdp_kernel_split_cm, activation=activation),
         grid=(Mp // block_m,), in_specs=split_in, out_specs=[bs, bs],
         out_shape=[jax.ShapeDtypeStruct((ci, Mp), x.dtype),
                    jax.ShapeDtypeStruct((ci, Mp), x.dtype)],
@@ -132,7 +132,7 @@ def gated_dual_proj(x, wp, bp, wg, bg, mask, *, block_m=64, split=False,
     return left[:, :M], right[:, :M]
   bs = pl.BlockSpec((block_m, ci), lambda i: (i, 0))
   left, right = pl.pallas_call(
-      _gdp_kernel_split,
+      functools.partial(_gdp_kernel_split, activation=activation),
       grid=(Mp // block_m,), in_specs=split_in, out_specs=[bs, bs],
       out_shape=[jax.ShapeDtypeStruct((Mp, ci), x.dtype),
                  jax.ShapeDtypeStruct((Mp, ci), x.dtype)],
