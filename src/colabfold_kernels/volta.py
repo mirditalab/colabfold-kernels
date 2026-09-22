@@ -55,8 +55,7 @@ def _attn_bwd_symbol(cc):
 
 
 def bwd_available(cc):
-    """True if the backward library for this device loads. Wheels before 0.3.0
-    carry no backward, so a caller that wants gradients has to ask."""
+    """True if the backward library for this device loads."""
     return _load("attention_bwd", cc, (_attn_bwd_symbol(cc),))
 
 
@@ -130,23 +129,25 @@ def _attn_bwd_call(q, k, v, bias, kmask, out, dout, lse, *, sym, sm_scale, want_
 
 # The custom_vjp covers the kernel call only. Padding the head dim and slicing
 # the output are ordinary jnp ops, so their transposes come for free.
-@functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7, 8, 9))
-def _attn_diff(q, k, v, bias, kmask, sym, bwd_sym, sm_scale, block_q, block_k):
-    return _attn_call(q, k, v, bias, kmask, sym=sym, sm_scale=sm_scale,
+@functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7, 8))
+def _attn_diff(q, k, v, bias, kmask, cc, sm_scale, block_q, block_k):
+    return _attn_call(q, k, v, bias, kmask, sym=_attn_symbol(cc), sm_scale=sm_scale,
                       block_q=block_q, block_k=block_k, want_lse=False)
 
 
-def _attn_diff_fwd(q, k, v, bias, kmask, sym, bwd_sym, sm_scale, block_q, block_k):
-    out, lse = _attn_call(q, k, v, bias, kmask, sym=sym, sm_scale=sm_scale,
+def _attn_diff_fwd(q, k, v, bias, kmask, cc, sm_scale, block_q, block_k):
+    out, lse = _attn_call(q, k, v, bias, kmask, sym=_attn_symbol(cc), sm_scale=sm_scale,
                           block_q=block_q, block_k=block_k, want_lse=True)
     return out, (q, k, v, bias, kmask, out, lse)
 
 
-def _attn_diff_bwd(sym, bwd_sym, sm_scale, block_q, block_k, res, dout):
+def _attn_diff_bwd(cc, sm_scale, block_q, block_k, res, dout):
     q, k, v, bias, kmask, out, lse = res
+    # the forward registers only its own symbol
+    _load("attention_bwd", cc, (_attn_bwd_symbol(cc),))
     dq, dk, dv, dbias = _attn_bwd_call(
         q, k, v, bias, kmask, out, dout.astype(jnp.float16), lse,
-        sym=bwd_sym, sm_scale=sm_scale, want_dbias=True)
+        sym=_attn_bwd_symbol(cc), sm_scale=sm_scale, want_dbias=True)
     # kmask is integral, thus its cotangent is the empty float0.
     return (dq, dk, dv, dbias.astype(bias.dtype),
             jnp.zeros(kmask.shape, jax.dtypes.float0))
@@ -159,8 +160,8 @@ def volta_attention(q, k, v, mask_bias, nonbatched_bias, scale, cc,
                     block_q=64, block_k=32):
     """Drop-in for tri_flash.pallas_attention. q/k/v [b,h,S,c] float16.
 
-    Differentiable where the wheel carries a backward; bwd_available(cc) says
-    whether it does, because one built before 0.3.0 does not.
+    Differentiable; bwd_available(cc) says whether the backward library is
+    there to do it.
     """
     in_dtype = q.dtype
     b, h, sq, c = q.shape
@@ -181,8 +182,7 @@ def volta_attention(q, k, v, mask_bias, nonbatched_bias, scale, cc,
             else nonbatched_bias.astype(jnp.float16))
     out = _attn_diff(q.astype(jnp.float16), k.astype(jnp.float16),
                      v.astype(jnp.float16), bias, kmask,
-                     _attn_symbol(cc), _attn_bwd_symbol(cc), float(scale),
-                     block_q, block_k)
+                     int(cc), float(scale), block_q, block_k)
     if pad_to is not None:
         out = out[..., :c]
     return out.astype(in_dtype)
