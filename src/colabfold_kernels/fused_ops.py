@@ -43,15 +43,16 @@ def layer_norm(global_config, dtype):
   import jax.numpy as jnp
   if not global_config.get('use_pallas', False):
     return None
+  from colabfold_kernels.grads import differentiable_layer_norm
   cc = _legacy_cc(global_config)
   if dtype == jnp.float16 and cc is not None:
     va = _volta()
     if va.ops_available(cc):
-      return va.volta_layer_norm
+      return differentiable_layer_norm(va.volta_layer_norm)
   if (global_config.get('kernel_backend', 'pallas') == 'pallas'
       and dtype in (jnp.bfloat16, jnp.float32)):
     from colabfold_kernels.tri_mul import pallas_layer_norm
-    return pallas_layer_norm
+    return differentiable_layer_norm(pallas_layer_norm)
   return None
 
 
@@ -61,15 +62,19 @@ def gated_dual_proj(global_config, dtype, activation=None):
   import jax.numpy as jnp
   if not global_config.get('use_pallas', False):
     return None
+  from colabfold_kernels.grads import differentiable_gated_dual_proj
   cc = _legacy_cc(global_config)
+  act = jax.nn.sigmoid if activation is None else activation
   # the prebuilt kernels gate with a sigmoid and nothing else
   if (dtype == jnp.float16 and cc is not None
       and activation in (None, jax.nn.sigmoid)):
     va = _volta()
     if va.ops_available(cc):
-      return functools.partial(va.volta_gated_dual_proj, cc=cc)
+      return differentiable_gated_dual_proj(
+          functools.partial(va.volta_gated_dual_proj, cc=cc), act)
   if (global_config.get('kernel_backend', 'pallas') == 'pallas'
       and dtype in (jnp.bfloat16, jnp.float16)):
     from colabfold_kernels.tri_mul import gated_dual_proj as gdp
-    return gdp if activation is None else functools.partial(gdp, activation=activation)
+    fwd = gdp if activation is None else functools.partial(gdp, activation=activation)
+    return differentiable_gated_dual_proj(fwd, act)
   return None
