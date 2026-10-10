@@ -68,6 +68,15 @@ def transition(global_config, dtype, num_channel, num_intermediate):
   return differentiable_via(t.fused_transition, t.ref_transition, nondiff=('eps', 'add_input'))
 
 
+def trimul_epilogue(global_config, dtype):
+  """-> f(x_cm, act, ln_scale, ln_offset, wo, bo, wg, bg, *, eps) or None."""
+  if not _pallas_half(global_config, dtype):
+    return None
+  from colabfold_kernels.grads import differentiable_via
+  from colabfold_kernels import tri_mul
+  return differentiable_via(tri_mul.trimul_epilogue, tri_mul.ref_trimul_epilogue, nondiff=('eps',))
+
+
 def layer_norm(global_config, dtype):
   """-> f(x, scale, offset, *, eps) or None. Last-axis, scale+offset only."""
   import jax.numpy as jnp

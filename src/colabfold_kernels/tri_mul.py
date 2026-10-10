@@ -147,6 +147,73 @@ def gated_dual_proj(x, wp, bp, wg, bg, mask, *, block_m=None, split=False,
   return left[:M], right[:M]
 
 
+def _epilogue_kernel(x_ref, a_ref, s_ref, o_ref_ln, wo_ref, bo_ref, wg_ref, bg_ref, *rest,
+                     eps, m, block_m):
+  r_ref, o_ref = rest if len(rest) == 2 else (None, rest[0])
+  # x_ref [C, block_m] channel-major triangle product; a_ref [block_m, Ca] normed input
+  rows = (pl.program_id(0) * block_m + jnp.arange(block_m)) < m
+  x = plgpu.load(x_ref, mask=rows[None, :], other=0.0).astype(jnp.float32).T
+  mean = jnp.mean(x, axis=-1, keepdims=True)
+  d = x - mean
+  var = jnp.mean(d * d, axis=-1, keepdims=True)
+  y = d * jax.lax.rsqrt(var + eps)
+  y = y * s_ref[...][None, :].astype(jnp.float32) + o_ref_ln[...][None, :].astype(jnp.float32)
+  out = _dot(y.astype(wo_ref.dtype), wo_ref[...]) + bo_ref[...][None, :].astype(jnp.float32)
+  a = plgpu.load(a_ref, mask=rows[:, None], other=0.0)
+  gate = _dot(a, wg_ref[...]) + bg_ref[...][None, :].astype(jnp.float32)
+  out = out * jax.nn.sigmoid(gate)
+  if r_ref is not None:
+    out = out + plgpu.load(r_ref, mask=rows[:, None], other=0.0).astype(jnp.float32)
+  plgpu.store(o_ref, out.astype(o_ref.dtype), mask=rows[:, None])
+
+
+def epilogue_supported(c, ca, o):
+  """Whole-tile dots: power-of-two widths of at least 16 (Triton's dot K), at most 128 (shared memory)."""
+  return all(w & (w - 1) == 0 and 16 <= w <= 128 for w in (c, ca, o))
+
+
+@functools.partial(jax.jit, static_argnames=("eps", "block_m", "num_warps", "num_stages"))
+def trimul_epilogue(x_cm, act, ln_scale, ln_offset, wo, bo, wg, bg, residual=None, *, eps=1e-5,
+                    block_m=64, num_warps=4, num_stages=2):
+  """Fused triangle-multiplication output: sigmoid(act @ wg + bg) * (LN(x_cm.T) @ wo + bo).
+
+  x_cm [C, M] channel-major einsum output; act [M, Ca] the normed module input;
+  wo [C, O]; wg [Ca, O]. Replaces the transpose, center LayerNorm, output and gating projections.
+  residual [M, O], when given, is added: the module's residual update in the same pass.
+  Widths the kernel does not take run the reference in XLA. The result has the residual's dtype, else act's.
+  """
+  c, m = x_cm.shape
+  ca, o = act.shape[1], wo.shape[1]
+  dtype = act.dtype if residual is None else residual.dtype
+  if not epilogue_supported(c, ca, o):
+    return ref_trimul_epilogue(x_cm, act, ln_scale, ln_offset, wo, bo, wg, bg, residual, eps=eps).astype(dtype)
+  vec = lambda n: pl.BlockSpec((n,), lambda i: (0,))
+  rows = pl.BlockSpec((block_m, o), lambda i: (i, 0))
+  extra = [] if residual is None else [residual]
+  return pl.pallas_call(
+      functools.partial(_epilogue_kernel, eps=eps, m=m, block_m=block_m),
+      grid=(pl.cdiv(m, block_m),),
+      in_specs=[pl.BlockSpec((c, block_m), lambda i: (0, i)),
+                pl.BlockSpec((block_m, ca), lambda i: (i, 0)), vec(c), vec(c),
+                pl.BlockSpec((c, o), lambda i: (0, 0)), vec(o),
+                pl.BlockSpec((ca, o), lambda i: (0, 0)), vec(o)] + [rows] * len(extra),
+      out_specs=rows,
+      out_shape=jax.ShapeDtypeStruct((m, o), dtype),
+      compiler_params=plgpu.CompilerParams(num_warps=num_warps, num_stages=num_stages),
+      name="trimul_epilogue",
+  )(x_cm, act, ln_scale, ln_offset, wo, bo, wg, bg, *extra)
+
+
+def ref_trimul_epilogue(x_cm, act, ln_scale, ln_offset, wo, bo, wg, bg, residual=None, *, eps=1e-5):
+  x = x_cm.T.astype(jnp.float32)
+  mean = x.mean(-1, keepdims=True)
+  var = ((x - mean) ** 2).mean(-1, keepdims=True)
+  y = (x - mean) * jax.lax.rsqrt(var + eps) * ln_scale + ln_offset
+  out = y @ wo.astype(jnp.float32) + bo.astype(jnp.float32)
+  out = out * jax.nn.sigmoid(act.astype(jnp.float32) @ wg.astype(jnp.float32) + bg.astype(jnp.float32))
+  return out if residual is None else out + residual.astype(jnp.float32)
+
+
 def ref_gdp(x, wp, bp, wg, bg, mask):
   proj = x @ wp + bp
   gate = x @ wg + bg
