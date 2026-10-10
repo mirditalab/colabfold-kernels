@@ -14,6 +14,8 @@ import jax, jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
+from colabfold_kernels.device import is_rocm
+
 # jnp.dot is stable across jax versions, contrary to pl.dot/plgpu.dot
 _dot = functools.partial(jnp.dot, preferred_element_type=jnp.float32)
 
@@ -97,7 +99,7 @@ def _gdp_tiled(x, wp, bp, wg, bg, mask, activation):
 
 @functools.partial(jax.jit,
                    static_argnames=("block_m", "split", "channel_major", "activation"))
-def gated_dual_proj(x, wp, bp, wg, bg, mask, *, block_m=64, split=False,
+def gated_dual_proj(x, wp, bp, wg, bg, mask, *, block_m=None, split=False,
                     channel_major=False, activation=jax.nn.sigmoid):
   # x [M,K]; wp/wg [K,P]; bp/bg [P]; mask [M].
   # split=False -> gated [M,P]; split=True -> (left [M,P/2], right [M,P/2]),
@@ -106,12 +108,16 @@ def gated_dual_proj(x, wp, bp, wg, bg, mask, *, block_m=64, split=False,
     return _gdp_tiled(x, wp, bp, wg, bg, mask, activation)
   M, K = x.shape
   P = wp.shape[1]
+  # swept on sm_120: 128 rows x 8 warps is 17% faster, but only worth it without a pad copy; ROCm keeps 64 x 4
+  wide = not is_rocm()
+  block_m = block_m or (128 if wide and M % 128 == 0 else 64)
   Mp = -(-M // block_m) * block_m
   x = jnp.pad(x, [(0, Mp - M), (0, 0)])
   mask = jnp.pad(mask, [(0, Mp - M)])
   xspec = pl.BlockSpec((block_m, K), lambda i: (i, 0))
   mspec = pl.BlockSpec((block_m,), lambda i: (i,))
-  cp = plgpu.CompilerParams(num_warps=4, num_stages=1)
+  cp = (plgpu.CompilerParams(num_warps=8, num_stages=2) if wide and block_m == 128
+        else plgpu.CompilerParams(num_warps=4, num_stages=1))
   ci = P // 2
   wpl, wpr = wp[:, :ci], wp[:, ci:]
   wgl, wgr = wg[:, :ci], wg[:, ci:]
