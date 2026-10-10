@@ -100,3 +100,44 @@ def differentiable_gated_dual_proj(fwd, activation):
   def call(x, wp, bp, wg, bg, mask, *, split=False, channel_major=False):
     return _gdp(fwd, x, wp, bp, wg, bg, mask, split, channel_major, activation)
   return call
+
+
+# ---- forward-only kernels, backward through a differentiable reference -------
+def differentiable_via(fwd, ref, nondiff=()):
+  """fwd's forward with the gradient of ref, which recomputes in the backward.
+
+  fwd and ref take the same arguments; the keyword arguments named in nondiff are static and
+  integral positional inputs get the empty float0 cotangent.
+  """
+  def call(*args, **kwargs):
+    if set(kwargs) - set(nondiff):
+      raise TypeError(f"{getattr(fwd, '__name__', fwd)}: pass {sorted(set(kwargs) - set(nondiff))} positionally")
+    static = tuple(sorted(kwargs.items()))
+    return _via(fwd, ref, static, *args)
+  return functools.wraps(fwd)(call)
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(0, 1, 2))
+def _via(fwd, ref, static, *args):
+  return fwd(*args, **dict(static))
+
+
+def _via_fwd(fwd, ref, static, *args):
+  return _via(fwd, ref, static, *args), args
+
+
+def _via_bwd(fwd, ref, static, args, dy):
+  diff = [i for i, a in enumerate(args)
+          if a is not None and jnp.issubdtype(jnp.asarray(a).dtype, jnp.inexact)]
+  def f(*xs):
+    full = list(args)
+    for i, x in zip(diff, xs):
+      full[i] = x
+    return ref(*full, **dict(static)).astype(dy.dtype)
+  _, vjp = jax.vjp(f, *[args[i] for i in diff])
+  grads = dict(zip(diff, vjp(dy)))
+  return tuple(None if a is None else grads[i] if i in grads else _zero_like_cotangent(a)
+               for i, a in enumerate(args))
+
+
+_via.defvjp(_via_fwd, _via_bwd)
