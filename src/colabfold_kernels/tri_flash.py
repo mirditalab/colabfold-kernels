@@ -63,8 +63,9 @@ def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, o_ref, *rest,
       qk = part if qk is None else qk + part
     bias = plgpu.load(bias_ref.at[:, sl], mask=kb[None, :], other=0.0)
     qk = (qk * sm_scale + bias) * LOG2E
-    km = plgpu.load(kmask_ref.at[sl], mask=kb, other=False)  # OOB keys -> masked
-    qk = jnp.where(km[None, :], qk, NEG)
+    km = plgpu.load(kmask_ref.at[sl], mask=kb, other=False)
+    # masked keys share a finite floor; keys past Sk get none, so a fully masked row averages Sk keys
+    qk = jnp.where(km[None, :], qk, jnp.where(kb, NEG, -jnp.inf)[None, :])
     m_curr = jnp.max(qk, axis=-1)
     m_next = jnp.maximum(m_prev, m_curr)
     corr = jnp.exp2(m_prev - m_next)
@@ -182,7 +183,8 @@ def _bwd_kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, do_ref, lse_ref, delta
     # the clamp the forward used, so an all-masked row differentiates the
     # uniform softmax it was given
     s = jnp.where(live, (qk * sm_scale + bias) * LOG2E, NEG)
-    p = jnp.exp2(s - lse[:, None])
+    # NEG absorbs log2(l) in a fully masked row's lse, whose forward was the uniform 1/Sk
+    p = jnp.where(lse[:, None] <= NEG / 2, jnp.where(kb, 1. / sk, 0.)[None, :], jnp.exp2(s - lse[:, None]))
     # a masked logit is a constant, thus nothing flows back through it
     ds = jnp.where(live, p * (dp - delta[:, None]), 0.0)
 
