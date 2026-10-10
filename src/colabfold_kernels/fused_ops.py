@@ -48,12 +48,22 @@ def _pallas_half(global_config, dtype):
 
 def packed_attention(global_config, dtype, key_dim, value_dim):
   """-> f(p, bias, kmask, gate_bias, *, sm_scale, column) or None; p is the packed [X, Y, G, H, D] projection."""
+  import jax.numpy as jnp
   from colabfold_kernels.grads import differentiable_via
   from colabfold_kernels import packed_attn as pa
   heads = attention(global_config, dtype, key_dim, value_dim)
-  if heads is None or key_dim != value_dim or not _pallas_half(global_config, dtype):
+  if heads is None or key_dim != value_dim:
     return None
   ref = functools.partial(pa.attention_via, attention=heads)
+  cc = _legacy_cc(global_config)
+  if cc is not None and dtype == jnp.float16:
+    va = _volta()
+    if not va.packed_available(cc, key_dim):
+      return None
+    return differentiable_via(functools.partial(va.volta_packed_attention, cc=cc), ref,
+                              nondiff=('sm_scale', 'column'))
+  if not _pallas_half(global_config, dtype):
+    return None
   return differentiable_via(pa.packed_attention, ref, nondiff=('sm_scale', 'column'))
 
 
