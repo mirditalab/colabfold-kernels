@@ -1,4 +1,5 @@
 """What the GPUs here can run, so a caller need not work it out itself."""
+import functools
 
 
 def compute_capability():
@@ -9,6 +10,13 @@ def compute_capability():
     return int(round(float(cc) * 10)) if "." in cc else int(cc)
   except Exception:
     return None
+
+
+@functools.lru_cache(maxsize=None)
+def is_rocm():
+  """True on an AMD GPU, where Triton tiles want other sizes than on NVIDIA."""
+  import jax
+  return "rocm" in (jax.default_backend() + jax.devices()[0].client.platform_version).lower()
 
 
 def shared_memory_limit():

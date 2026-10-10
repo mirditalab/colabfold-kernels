@@ -57,6 +57,17 @@ def packed_attention(global_config, dtype, key_dim, value_dim):
   return differentiable_via(pa.packed_attention, ref, nondiff=('sm_scale', 'column'))
 
 
+def transition(global_config, dtype, num_channel, num_intermediate):
+  """-> f(x, ln_scale, ln_offset, w1, b1, w2, b2, *, eps) or None: the whole LN-MLP transition."""
+  if not _pallas_half(global_config, dtype):
+    return None
+  from colabfold_kernels import transition as t
+  from colabfold_kernels.grads import differentiable_via
+  if not t.supported(num_channel, num_intermediate):
+    return None
+  return differentiable_via(t.fused_transition, t.ref_transition, nondiff=('eps', 'add_input'))
+
+
 def layer_norm(global_config, dtype):
   """-> f(x, scale, offset, *, eps) or None. Last-axis, scale+offset only."""
   import jax.numpy as jnp
