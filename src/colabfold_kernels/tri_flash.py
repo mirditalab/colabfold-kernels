@@ -33,9 +33,11 @@ def _chunks(d):
   return tuple(out) if off < tile else ((0, tile),)
 
 
-def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, o_ref, *rest,
-            sm_scale, block_q, block_k, sq, d, chunks):
-  lse_ref = rest[0] if rest else None
+def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, *rest,
+            sm_scale, block_q, block_k, sq, d, chunks, gated=False):
+  # gated: a gate [block_q, W] and its bias [W] come first, the output is o * sigmoid(gate + bias)
+  g_ref, gb_ref, *rest = rest if gated else (None, None, *rest)
+  o_ref, lse_ref = rest[0], rest[1] if len(rest) > 1 else None
   # q_ref [block_q, W]; k_ref/v_ref [Sk, W]; bias_ref [block_q, Sk]; kmask_ref [Sk],
   # W being d split into power-of-two dot widths. Sq/Sk are NOT padded to block
   # multiples; boundary blocks are handled with masked loads (offs < Sk) and a
@@ -85,8 +87,13 @@ def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, o_ref, *rest,
     plgpu.store(lse_ref, m_i + jnp.log2(l_i), mask=q_valid)
   for oc, (off, w), c in zip(os, chunks, cols):
     m = q_valid[:, None] if c is None else q_valid[:, None] & c[None, :]
-    plgpu.store(o_ref.at[:, pl.dslice(off, w)],
-                (oc / l_i[:, None]).astype(o_ref.dtype), mask=m)
+    o = oc / l_i[:, None]
+    if gated:
+      g = plgpu.load(g_ref.at[:, pl.dslice(off, w)], mask=m, other=0.0).astype(jnp.float32)
+      gb = (gb_ref[pl.dslice(off, w)] if c is None else
+            plgpu.load(gb_ref.at[pl.dslice(off, w)], mask=c, other=0.0)).astype(jnp.float32)
+      o = o * jax.nn.sigmoid(g + gb[None, :])
+    plgpu.store(o_ref.at[:, pl.dslice(off, w)], o.astype(o_ref.dtype), mask=m)
 
 
 @functools.partial(jax.jit, static_argnames=(

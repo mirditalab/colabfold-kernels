@@ -38,6 +38,25 @@ def attention(global_config, dtype, key_dim, value_dim, layout='heads'):
   return None
 
 
+def _pallas_half(global_config, dtype):
+  """The Pallas backend is on and dtype is a half type (the forward-only fused kernels)."""
+  import jax.numpy as jnp
+  return (global_config.get('use_pallas', False) and _legacy_cc(global_config) is None
+          and global_config.get('kernel_backend', 'pallas') == 'pallas'
+          and dtype in (jnp.bfloat16, jnp.float16))
+
+
+def packed_attention(global_config, dtype, key_dim, value_dim):
+  """-> f(p, bias, kmask, gate_bias, *, sm_scale, column) or None; p is the packed [X, Y, G, H, D] projection."""
+  from colabfold_kernels.grads import differentiable_via
+  from colabfold_kernels import packed_attn as pa
+  heads = attention(global_config, dtype, key_dim, value_dim)
+  if heads is None or key_dim != value_dim or not _pallas_half(global_config, dtype):
+    return None
+  ref = functools.partial(pa.attention_via, attention=heads)
+  return differentiable_via(pa.packed_attention, ref, nondiff=('sm_scale', 'column'))
+
+
 def layer_norm(global_config, dtype):
   """-> f(x, scale, offset, *, eps) or None. Last-axis, scale+offset only."""
   import jax.numpy as jnp
