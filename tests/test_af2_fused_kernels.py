@@ -37,13 +37,16 @@ def check(name, fn, ref, args, diff, tol=0.03):
   print(f"{'ok ' if ok else 'BAD'} {name:<34} fwd {fwd:.1e}  grad {max(errs):.1e}", flush=True)
 
 # CK_LEGACY=1 also runs the sm_70 (wmma) and sm_75 (mma) packed kernels, in float16
-configs = [("pallas", gc, dt)] + [(f"sm{cc}", {"use_pallas": True, "kernel_backend": "cuda_legacy",
+configs = [("triton", {**gc, "mosaic_gpu": False}, dt), ("pallas", gc, dt)] + [(f"sm{cc}", {"use_pallas": True, "kernel_backend": "cuda_legacy",
                                              "compute_capability": cc}, jnp.float16)
                                   for cc in ((70, 75) if os.environ.get("CK_LEGACY") else ())]
 for tag, cfg, adt in configs:
   for X, Y, H, D, gated, column in ((64, 96, 4, 32, True, False), (96, 64, 4, 32, True, True),
                                     (37, 53, 8, 8, True, False), (50, 50, 4, 32, False, True),
-                                    (40, 24, 8, 8, True, True), (33, 48, 4, 16, True, True), (5, 1, 4, 32, True, False)):
+                                    (40, 24, 8, 8, True, True), (33, 48, 4, 16, True, True), (5, 1, 4, 32, True, False),
+                                    # Mosaic GPU on sm_12x: partial query/key tiles and batch groups, head dims 16 and 64
+                                    (7, 136, 4, 32, True, False), (136, 5, 2, 64, False, True), (10, 40, 8, 16, True, False),
+                                    (40, 6, 4, 16, True, True)):
     pa = fused_ops.packed_attention(cfg, adt, D, D)
     G = 4 if gated else 3
     nb, s = (Y, X) if column else (X, Y)

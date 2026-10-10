@@ -46,6 +46,36 @@ def _pallas_half(global_config, dtype):
           and dtype in (jnp.bfloat16, jnp.float16))
 
 
+@functools.lru_cache(maxsize=None)
+def _mgpu_attn():
+  """mgpu_attn on sm_12x, None elsewhere or when this jax's Mosaic GPU API does not match."""
+  from colabfold_kernels.device import compute_capability
+  cc = compute_capability()
+  if cc is None or not 120 <= cc < 130:
+    return None
+  try:
+    import jax
+    import jax.numpy as jnp
+    from colabfold_kernels import mgpu_attn
+    # a Mosaic GPU API this kernel does not match fails only once lowered, so compile a small call here
+    sds = jax.ShapeDtypeStruct
+    jax.jit(functools.partial(mgpu_attn.packed_attention, sm_scale=1.0)).lower(
+        sds((8, 64, 4, 2, 32), jnp.bfloat16), sds((2, 64, 64), jnp.bfloat16), sds((8, 64), jnp.bool_),
+        sds((2, 32), jnp.bfloat16)).compile()
+    return mgpu_attn
+  except Exception:
+    return None
+
+
+def _mosaic_or_triton(p, bias, kmask, gate_bias=None, *, sm_scale, column=False):
+  """The Mosaic GPU kernel where it runs, else Triton's."""
+  from colabfold_kernels import packed_attn as pa
+  mgpu_attn = _mgpu_attn()
+  if mgpu_attn is not None and mgpu_attn.supported(p.shape[-1], p.dtype, p.shape[0 if column else 1]):
+    return mgpu_attn.packed_attention(p, bias, kmask, gate_bias, sm_scale=sm_scale, column=column)
+  return pa.packed_attention(p, bias, kmask, gate_bias, sm_scale=sm_scale, column=column)
+
+
 def packed_attention(global_config, dtype, key_dim, value_dim):
   """-> f(p, bias, kmask, gate_bias, *, sm_scale, column) or None; p is the packed [X, Y, G, H, D] projection."""
   import jax.numpy as jnp
@@ -64,7 +94,8 @@ def packed_attention(global_config, dtype, key_dim, value_dim):
                               nondiff=('sm_scale', 'column'))
   if not _pallas_half(global_config, dtype):
     return None
-  return differentiable_via(pa.packed_attention, ref, nondiff=('sm_scale', 'column'))
+  fwd = _mosaic_or_triton if global_config.get('mosaic_gpu', True) else pa.packed_attention
+  return differentiable_via(fwd, ref, nondiff=('sm_scale', 'column'))
 
 
 def transition(global_config, dtype, num_channel, num_intermediate):
