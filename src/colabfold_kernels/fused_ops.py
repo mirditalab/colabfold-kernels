@@ -109,6 +109,17 @@ def transition(global_config, dtype, num_channel, num_intermediate):
   return differentiable_via(t.fused_transition, t.ref_transition, nondiff=('eps', 'add_input'))
 
 
+def glu_transition(global_config, dtype, num_channel, num_intermediate):
+  """-> f(x, ln_scale, ln_offset, wa, wb, wo, keep=None, *, eps, add_input) or None: AF3's whole swish-GLU transition."""
+  if not _pallas_half(global_config, dtype):
+    return None
+  from colabfold_kernels import transition as t
+  from colabfold_kernels.grads import differentiable_via
+  if not t.glu_supported(num_channel, num_intermediate):
+    return None
+  return differentiable_via(t.fused_glu_transition, t.ref_glu_transition, nondiff=('eps', 'add_input'))
+
+
 def trimul_epilogue(global_config, dtype):
   """-> f(x_cm, act, ln_scale, ln_offset, wo, bo, wg, bg, *, eps) or None."""
   if not _pallas_half(global_config, dtype):

@@ -15,6 +15,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
 from colabfold_kernels.device import is_rocm
+from colabfold_kernels.transition import ln_rows, ref_ln
 
 # jnp.dot is stable across jax versions, contrary to pl.dot/plgpu.dot
 _dot = functools.partial(jnp.dot, preferred_element_type=jnp.float32)
@@ -153,11 +154,7 @@ def _epilogue_kernel(x_ref, a_ref, s_ref, o_ref_ln, wo_ref, bo_ref, wg_ref, bg_r
   # x_ref [C, block_m] channel-major triangle product; a_ref [block_m, Ca] normed input
   rows = (pl.program_id(0) * block_m + jnp.arange(block_m)) < m
   x = plgpu.load(x_ref, mask=rows[None, :], other=0.0).astype(jnp.float32).T
-  mean = jnp.mean(x, axis=-1, keepdims=True)
-  d = x - mean
-  var = jnp.mean(d * d, axis=-1, keepdims=True)
-  y = d * jax.lax.rsqrt(var + eps)
-  y = y * s_ref[...][None, :].astype(jnp.float32) + o_ref_ln[...][None, :].astype(jnp.float32)
+  y = ln_rows(x, s_ref, o_ref_ln, eps)
   out = _dot(y.astype(wo_ref.dtype), wo_ref[...]) + bo_ref[...][None, :].astype(jnp.float32)
   a = plgpu.load(a_ref, mask=rows[:, None], other=0.0)
   gate = _dot(a, wg_ref[...]) + bg_ref[...][None, :].astype(jnp.float32)
@@ -205,10 +202,7 @@ def trimul_epilogue(x_cm, act, ln_scale, ln_offset, wo, bo, wg, bg, residual=Non
 
 
 def ref_trimul_epilogue(x_cm, act, ln_scale, ln_offset, wo, bo, wg, bg, residual=None, *, eps=1e-5):
-  x = x_cm.T.astype(jnp.float32)
-  mean = x.mean(-1, keepdims=True)
-  var = ((x - mean) ** 2).mean(-1, keepdims=True)
-  y = (x - mean) * jax.lax.rsqrt(var + eps) * ln_scale + ln_offset
+  y = ref_ln(x_cm.T.astype(jnp.float32), ln_scale, ln_offset, eps)
   out = y @ wo.astype(jnp.float32) + bo.astype(jnp.float32)
   out = out * jax.nn.sigmoid(act.astype(jnp.float32) @ wg.astype(jnp.float32) + bg.astype(jnp.float32))
   return out if residual is None else out + residual.astype(jnp.float32)

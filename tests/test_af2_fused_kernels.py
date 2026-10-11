@@ -4,7 +4,7 @@ sys.path.insert(0, os.environ.get(
     "CK_SRC", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src")))
 from colabfold_kernels import fused_ops
 from colabfold_kernels.packed_attn import ref_packed_attention
-from colabfold_kernels.transition import ref_transition
+from colabfold_kernels.transition import ref_glu_transition, ref_transition
 from colabfold_kernels.tri_mul import ref_trimul_epilogue
 
 def rel(a, b):
@@ -68,6 +68,19 @@ for M, C, F in ((4096, 128, 4), (777, 64, 4), (1000, 256, 4), (300, 64, 2), (1, 
   for add in (False, True):
     check(f"transition {M}x{C}{' +x' if add else ''}", lambda *a, add=add: tr(*a, add_input=add),
           lambda *a, add=add: ref_transition(*a, add_input=add), args, list(range(7)))
+
+# AF3's swish-GLU transition, with OpenFold3's row mask and the residual
+for M, C in ((4096, 128), (777, 64), (1, 128), (127, 128), (64, 64)):
+  glu = fused_ops.glu_transition(gc, dt, C, 4 * C)
+  args = (f(M, C), 1 + f32(C, s=.1), f32(C, s=.1), f(C, 4 * C, s=C ** -.5), f(C, 4 * C, s=C ** -.5),
+          f(4 * C, C, s=(4 * C) ** -.5))
+  keep = jnp.asarray(rng.random(M) > .2, dt)
+  for masked in (False, True):
+    for add in (False, True):
+      a = args + ((keep,) if masked else ())
+      check(f"glu_transition {M}x{C}{' keep' if masked else ''}{' +x' if add else ''}",
+            lambda *a, add=add: glu(*a, add_input=add), lambda *a, add=add: ref_glu_transition(*a, add_input=add),
+            a, list(range(6)))
 
 # AF2's fp16 path hands the epilogue a float32 product; a width the kernel does not take (96) runs XLA
 ep = fused_ops.trimul_epilogue(gc, dt)
