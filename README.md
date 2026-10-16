@@ -13,4 +13,7 @@ if kernel is not None:
     out = kernel(q, k, v, mask_bias, nonbatched_bias, scale)
 ```
 
-`attention`, `layer_norm` and `gated_dual_proj` each return `None` if not supported.
+`attention`, `layer_norm` and `gated_dual_proj` each return `None` if not supported, as do
+`fused_ops.packed_attention`, `transition`, `glu_transition` and `trimul_epilogue`.
+`diffusion.install()` samples AF3-family diffusion in the
+[colabfold-cuda-kernels](https://github.com/mirditalab/colabfold-cuda-kernels) megakernel.

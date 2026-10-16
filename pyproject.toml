@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "colabfold-kernels"
-version = "0.4.0"
+version = "0.5.0"
 description = "Fast fused kernels for ColabFold"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -18,7 +18,8 @@ classifiers = [
   "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
 dependencies = [
-  "colabfold-legacy-kernels>=0.4.0,<0.5; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "colabfold-legacy-kernels>=0.5.0,<0.6; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "colabfold-cuda-kernels>=0.1.0,<0.2; sys_platform == 'linux'",
 ]
 [project.urls]
 Homepage = "https://github.com/mirditalab/colabfold-kernels"
