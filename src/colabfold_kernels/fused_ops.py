@@ -46,6 +46,21 @@ def _pallas_half(global_config, dtype):
           and dtype in (jnp.bfloat16, jnp.float16))
 
 
+def fp8_attention(global_config, key_dim):
+  """The projection may write k and v in e4m3 for packed_attention: asked for (global_config.fp8), on a card with
+  8-bit MMAs (NVIDIA, compute capability 8.9 on), at a head dim of a power of two from their K of 32.
+
+  Not where the Mosaic GPU kernel runs: on sm_120 it is 27% faster in bf16 than Triton's in e4m3.
+  """
+  if not global_config.get('fp8', False) or key_dim & (key_dim - 1) or key_dim < 32:
+    return False
+  if global_config.get('mosaic_gpu', True) and _mgpu_attn() is not None:
+    return False
+  from colabfold_kernels.device import compute_capability, is_rocm
+  cc = compute_capability()
+  return cc is not None and cc >= 89 and not is_rocm()
+
+
 @functools.lru_cache(maxsize=None)
 def _mgpu_attn():
   """mgpu_attn on sm_12x, None elsewhere or when this jax's Mosaic GPU API does not match."""
@@ -67,9 +82,11 @@ def _mgpu_attn():
     return None
 
 
-def _mosaic_or_triton(p, bias, kmask, gate_bias=None, *, sm_scale, column=False):
-  """The Mosaic GPU kernel where it runs, else Triton's."""
+def _mosaic_or_triton(p, bias, kmask, gate_bias=None, kv=None, *, sm_scale, column=False):
+  """The Mosaic GPU kernel where it runs, else Triton's, the only one that takes e4m3 k and v."""
   from colabfold_kernels import packed_attn as pa
+  if kv is not None:
+    return pa.packed_attention(p, bias, kmask, gate_bias, kv, sm_scale=sm_scale, column=column)
   mgpu_attn = _mgpu_attn()
   if mgpu_attn is not None and mgpu_attn.supported(p.shape[-1], p.dtype, p.shape[0 if column else 1]):
     return mgpu_attn.packed_attention(p, bias, kmask, gate_bias, sm_scale=sm_scale, column=column)
@@ -158,9 +175,9 @@ def ln_projection(global_config, dtype, num_channel, num_output=None):
     return None
   from colabfold_kernels.grads import differentiable_via
   from colabfold_kernels import packed_attn as pa
-  if not pa.projection_supported(num_channel, *([] if num_output is None else [num_output])):
+  if not pa.ln_projection_supported(num_channel, num_output):
     return None
-  return differentiable_via(pa.ln_projection, pa.ref_ln_projection, nondiff=('eps',))
+  return differentiable_via(pa.ln_projection, pa.ref_ln_projection, nondiff=('eps', 'f8_slots'))
 
 
 def output_projection(global_config, dtype, num_input, num_output):
@@ -169,7 +186,7 @@ def output_projection(global_config, dtype, num_input, num_output):
     return None
   from colabfold_kernels.grads import differentiable_via
   from colabfold_kernels import packed_attn as pa
-  if not pa.projection_supported(num_input, num_output):
+  if not pa.output_projection_supported(num_input, num_output):
     return None
   return differentiable_via(pa.output_projection, pa.ref_output_projection)
 

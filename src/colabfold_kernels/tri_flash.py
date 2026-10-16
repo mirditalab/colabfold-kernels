@@ -15,6 +15,29 @@ _dot = functools.partial(jnp.dot, preferred_element_type=jnp.float32)
 
 NEG = -0.7 * float(np.finfo(np.float32).max)
 LOG2E = math.log2(math.e)
+E4M3_MAX = 448.0
+# softmax probabilities are at most 1: 2^8 times that, through the exponent, keeps the small ones in e4m3's range
+P_SHIFT = 8.0
+
+
+def e4m3(x):
+  """x rounded to float8 e4m3, saturating: the format has no infinity, so an unclipped cast past 448 gives NaN."""
+  return jnp.clip(x.astype(jnp.float32), -E4M3_MAX, E4M3_MAX).astype(jnp.float8_e4m3fn)
+
+
+def _and(a, b):
+  """a & b, where None is no mask."""
+  return b if a is None else a if b is None else a & b
+
+
+def _load(ref, mask, other):
+  """ref, masked where mask is given."""
+  return ref[...] if mask is None else plgpu.load(ref, mask=mask, other=other)
+
+
+def fp8_supported(d, block_k):
+  """An 8-bit MMA's K is 32: the head dim (q.k) and the key block (p.v) both need it, in one power-of-two chunk."""
+  return d & (d - 1) == 0 and d >= 32 and block_k >= 32
 
 
 def _pow2_tile(d):
@@ -34,8 +57,9 @@ def _chunks(d):
 
 
 def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, *rest,
-            sm_scale, block_q, block_k, sq, d, chunks, gated=False):
+            sm_scale, block_q, block_k, sq, d, chunks, gated=False, fp8=False):
   # gated: a gate [block_q, W] and its bias [W] come first, the output is o * sigmoid(gate + bias)
+  # fp8: k and v come in e4m3 (fp8_supported), q is cast here, both dots accumulate in fp32
   g_ref, gb_ref, *rest = rest if gated else (None, None, *rest)
   o_ref, lse_ref = rest[0], rest[1] if len(rest) > 1 else None
   # q_ref [block_q, W]; k_ref/v_ref [Sk, W]; bias_ref [block_q, Sk]; kmask_ref [Sk],
@@ -52,39 +76,46 @@ def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, *rest,
   qs = [plgpu.load(q_ref.at[:, pl.dslice(off, w)],
                    mask=q_valid[:, None] if c is None else q_valid[:, None] & c[None, :], other=0.0)
         for (off, w), c in zip(chunks, cols)]
+  if fp8:
+    qs = [e4m3(qc) for qc in qs]
   m_i = jnp.full(block_q, -float('inf'), jnp.float32)
   l_i = jnp.zeros(block_q, jnp.float32)
   os = [jnp.zeros((block_q, w), jnp.float32) for _, w in chunks]
 
-  def body(j, carry):
+  def body(j, carry, tail=False):
+    # tail: the one key block that runs past Sk; every other block is whole and needs no bounds masks
     o_prev, m_prev, l_prev = carry
-    start = j * block_k
-    kb = (start + jnp.arange(block_k)) < sk        # [block_k] in-bounds keys
+    # the tail's start is traced: a static one past Sk - block_k fails the slice bounds check its mask makes safe
+    start = jnp.int32(j * block_k) if tail else pl.multiple_of(j * block_k, block_k)
+    kb = (start + jnp.arange(block_k)) < sk if tail else None        # [block_k] in-bounds keys
     sl = pl.dslice(start, block_k)
     qk = None
     for qc, (off, w), c in zip(qs, chunks, cols):
-      m = kb[:, None] if c is None else kb[:, None] & c[None, :]
-      kc = plgpu.load(k_ref.at[sl, pl.dslice(off, w)], mask=m, other=0.0)
+      m = _and(None if kb is None else kb[:, None], None if c is None else c[None, :])
+      kc = _load(k_ref.at[sl, pl.dslice(off, w)], m, 0.0)
       part = _dot(qc, kc.T)                    # [block_q, block_k]
       qk = part if qk is None else qk + part
-    bias = plgpu.load(bias_ref.at[:, sl], mask=q_valid[:, None] & kb[None, :], other=0.0)
+    bias = plgpu.load(bias_ref.at[:, sl], mask=_and(q_valid[:, None], None if kb is None else kb[None, :]), other=0.0)
     qk = (qk * sm_scale + bias) * LOG2E
-    km = plgpu.load(kmask_ref.at[sl], mask=kb, other=False)
+    km = _load(kmask_ref.at[sl], kb, False)
     # masked keys share a finite floor; keys past Sk get none, so a fully masked row averages Sk keys
-    qk = jnp.where(km[None, :], qk, jnp.where(kb, NEG, -jnp.inf)[None, :])
+    qk = jnp.where(km[None, :], qk, NEG if kb is None else jnp.where(kb, NEG, -jnp.inf)[None, :])
     m_curr = jnp.max(qk, axis=-1)
     m_next = jnp.maximum(m_prev, m_curr)
     corr = jnp.exp2(m_prev - m_next)
-    s = jnp.exp2(qk - m_next[:, None])
+    s = jnp.exp2(qk - m_next[:, None] + (P_SHIFT if fp8 else 0.0))
     l_next = corr * l_prev + s.sum(axis=-1)
     o_next = []
     for oc, (off, w), c in zip(o_prev, chunks, cols):
-      m = kb[:, None] if c is None else kb[:, None] & c[None, :]
-      vc = plgpu.load(v_ref.at[sl, pl.dslice(off, w)], mask=m, other=0.0)
+      m = _and(None if kb is None else kb[:, None], None if c is None else c[None, :])
+      vc = _load(v_ref.at[sl, pl.dslice(off, w)], m, 0.0)
       o_next.append(corr[:, None] * oc + _dot(s.astype(vc.dtype), vc))
     return o_next, m_next, l_next
 
-  os, m_i, l_i = jax.lax.fori_loop(0, pl.cdiv(sk, block_k), body, (os, m_i, l_i))
+  carry = jax.lax.fori_loop(0, sk // block_k, body, (os, m_i, l_i))
+  if sk % block_k:
+    carry = body(sk // block_k, carry, tail=True)
+  os, m_i, l_i = carry
   if lse_ref is not None:
     # log2 domain, which is what the backward's exp2 wants
     plgpu.store(lse_ref, m_i + jnp.log2(l_i), mask=q_valid)
