@@ -185,7 +185,9 @@ def ln_gated_dual_proj(global_config, dtype, num_channel, num_intermediate):
     return None
   from colabfold_kernels.grads import differentiable_via
   from colabfold_kernels import tri_mul
-  if not tri_mul.epilogue_supported(num_channel, num_intermediate, num_intermediate):
+  # streamed up to 256 channels; at 512 XLA's projection is faster
+  if not (tri_mul.epilogue_supported(num_channel, num_intermediate, num_intermediate)
+          or tri_mul.stream_supported(num_channel, num_intermediate, widest=256)):
     return None
   return differentiable_via(tri_mul.ln_gated_dual_proj, tri_mul.ref_ln_gdp, nondiff=('eps',))
 

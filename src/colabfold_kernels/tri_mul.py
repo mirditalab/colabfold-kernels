@@ -14,7 +14,7 @@ import jax, jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
-from colabfold_kernels.device import is_rocm
+from colabfold_kernels.device import is_rocm, shared_memory_limit
 from colabfold_kernels.transition import fast, ln_rows, ref_ln, sigmoid
 from colabfold_kernels.tri_flash import e4m3
 
@@ -37,18 +37,30 @@ def _gdp_kernel_tiled(x_ref, wp_ref, bp_ref, wg_ref, bg_ref, mask_ref, o_ref, *,
   o_ref[...] = o.astype(o_ref.dtype)
 
 
-def _half(x, wp, bp, wg, bg, mask, activation):
+def _half(x, wp, bp, wg, bg, mask, activation, in_kernel=True):
   proj = _dot(x, wp) + bp[None, :].astype(jnp.float32)
   gate = _dot(x, wg) + bg[None, :].astype(jnp.float32)
-  return mask[:, None].astype(jnp.float32) * proj * fast(activation)(gate)
+  # fast()'s tanh forms are Pallas-only on CUDA
+  return mask[:, None].astype(jnp.float32) * proj * (fast(activation) if in_kernel else activation)(gate)
 
 
 def _gdp_kernel_split_cm(x_ref, wpl_ref, bpl_ref, wgl_ref, bgl_ref,
                          wpr_ref, bpr_ref, wgr_ref, bgr_ref, mask_ref,
-                         ol_ref, or_ref, *, activation):
+                         ol_ref, or_ref, *, activation, chunk=None):
   # _gdp_kernel_split, stored channel-major [ci, BM] for the triangle einsum.
+  # chunk: the output columns stream in chunks, for widths whose whole weights do not fit
   x = x_ref[...]
   m = mask_ref[...]
+  if chunk is not None:
+    def body(j, carry):
+      js = pl.ds(pl.multiple_of(j * chunk, chunk), chunk)
+      for w_p, b_p, w_g, b_g, o in ((wpl_ref, bpl_ref, wgl_ref, bgl_ref, ol_ref),
+                                    (wpr_ref, bpr_ref, wgr_ref, bgr_ref, or_ref)):
+        o[js, :] = _half(x, w_p[:, js], b_p[js], w_g[:, js], b_g[js], m, activation).T.astype(o.dtype)
+      return carry
+
+    jax.lax.fori_loop(0, ol_ref.shape[0] // chunk, body, 0)
+    return
   ol_ref[...] = _half(x, wpl_ref[...], bpl_ref[...], wgl_ref[...], bgl_ref[...],
                       m, activation).T.astype(ol_ref.dtype)
   or_ref[...] = _half(x, wpr_ref[...], bpr_ref[...], wgr_ref[...], bgr_ref[...],
@@ -57,19 +69,31 @@ def _gdp_kernel_split_cm(x_ref, wpl_ref, bpl_ref, wgl_ref, bgl_ref,
 
 def _ln_gdp_kernel(x_ref, s_ref, offset_ref, wpl_ref, bpl_ref, wgl_ref, bgl_ref,
                    wpr_ref, bpr_ref, wgr_ref, bgr_ref, mask_ref, ol_ref, or_ref, *, activation, eps, m, block_m,
-                   row_axis=0, m_out=None, fp8=False):
+                   row_axis=0, m_out=None, fp8=False, chunk=None):
   # _gdp_kernel_split_cm on LN(x), so the normed pair never leaves the SM; rows past m are masked, not padded
   # m_out: rows written, past m zeros (their mask reads 0), the padding an FP8 GEMM's 16-byte rows want
+  # chunk: the output columns stream in chunks, for widths whose whole weights do not fit
   row = pl.program_id(row_axis) * block_m + jnp.arange(block_m)
   rows, out_rows = row < m, row < (m_out or m)
   x = plgpu.load(x_ref, mask=rows[:, None], other=0.0).astype(jnp.float32)
   x = ln_rows(x, s_ref, offset_ref, eps).astype(x_ref.dtype)
   mask = plgpu.load(mask_ref, mask=rows, other=0)
   cast = e4m3 if fp8 else (lambda t: t.astype(ol_ref.dtype))
-  left = _half(x, wpl_ref[...], bpl_ref[...], wgl_ref[...], bgl_ref[...], mask, activation)
-  plgpu.store(ol_ref, cast(left.T), mask=out_rows[None, :])
-  right = _half(x, wpr_ref[...], bpr_ref[...], wgr_ref[...], bgr_ref[...], mask, activation)
-  plgpu.store(or_ref, cast(right.T), mask=out_rows[None, :])
+  halves = ((wpl_ref, bpl_ref, wgl_ref, bgl_ref, ol_ref), (wpr_ref, bpr_ref, wgr_ref, bgr_ref, or_ref))
+  if chunk is None:
+    for w_p, b_p, w_g, b_g, o in halves:
+      plgpu.store(o, cast(_half(x, w_p[...], b_p[...], w_g[...], b_g[...], mask, activation).T),
+                  mask=out_rows[None, :])
+    return
+
+  def body(j, carry):
+    js = pl.ds(pl.multiple_of(j * chunk, chunk), chunk)
+    for w_p, b_p, w_g, b_g, o in halves:
+      plgpu.store(o.at[js, :], cast(_half(x, w_p[:, js], b_p[js], w_g[:, js], b_g[js], mask, activation).T),
+                  mask=out_rows[None, :])
+    return carry
+
+  jax.lax.fori_loop(0, ol_ref.shape[0] // chunk, body, 0)
 
 
 def _gdp_kernel_split(x_ref, wpl_ref, bpl_ref, wgl_ref, bgl_ref,
@@ -85,6 +109,15 @@ def _gdp_kernel_split(x_ref, wpl_ref, bpl_ref, wgl_ref, bgl_ref,
                       m, activation).astype(ol_ref.dtype)
   or_ref[...] = _half(x, wpr_ref[...], bpr_ref[...], wgr_ref[...], bgr_ref[...],
                       m, activation).astype(or_ref.dtype)
+
+
+# (rows, warps, column chunk) of the streamed kernels, swept on gfx1151 at 256 and 512 channels; 128 rows run out of LDS
+_STREAM = (64, 8, 32)
+
+
+def stream_supported(*widths, widest=512):
+  """Streamed column chunks: power-of-two widths from 16 to `widest`."""
+  return all(w & (w - 1) == 0 and 16 <= w <= widest for w in widths)
 
 
 def _gdp_tiled(x, wp, bp, wg, bg, mask, activation):
@@ -127,17 +160,26 @@ def gated_dual_proj(x, wp, bp, wg, bg, mask, *, block_m=None, split=False,
     return _gdp_tiled(x, wp, bp, wg, bg, mask, activation)
   M, K = x.shape
   P = wp.shape[1]
+  ci = P // 2
+  # at 512 channels the streamed projection loses to XLA (gfx1151: 18.9 against 9.9 ms at 256 tokens)
+  stream = channel_major and max(K, ci) > 128 and stream_supported(K, ci, widest=256)
+  if channel_major and max(K, ci) > 128 and not stream:  # whole weights would not fit: XLA
+    g = _half(x, wp, bp, wg, bg, mask, activation, in_kernel=False).T.astype(x.dtype)
+    return g[:ci], g[ci:]
   # swept on sm_120: 128 rows x 8 warps is 17% faster, but only worth it without a pad copy; ROCm keeps 64 x 4
   wide = not is_rocm()
-  block_m = block_m or (128 if wide and M % 128 == 0 else 64)
+  if stream:
+    block_m = _STREAM[0]
+    cp = plgpu.CompilerParams(num_warps=_STREAM[1], num_stages=1)
+  else:
+    block_m = block_m or (128 if wide and M % 128 == 0 else 64)
+    cp = (plgpu.CompilerParams(num_warps=8, num_stages=2) if wide and block_m == 128
+          else plgpu.CompilerParams(num_warps=4, num_stages=1))
   Mp = -(-M // block_m) * block_m
   x = jnp.pad(x, [(0, Mp - M), (0, 0)])
   mask = jnp.pad(mask, [(0, Mp - M)])
   xspec = pl.BlockSpec((block_m, K), lambda i: (i, 0))
   mspec = pl.BlockSpec((block_m,), lambda i: (i,))
-  cp = (plgpu.CompilerParams(num_warps=8, num_stages=2) if wide and block_m == 128
-        else plgpu.CompilerParams(num_warps=4, num_stages=1))
-  ci = P // 2
   wpl, wpr = wp[:, :ci], wp[:, ci:]
   wgl, wgr = wg[:, :ci], wg[:, ci:]
   bpl, bpr = bp[:ci], bp[ci:]
@@ -148,7 +190,7 @@ def gated_dual_proj(x, wp, bp, wg, bg, mask, *, block_m=None, split=False,
   if channel_major:
     bs = pl.BlockSpec((ci, block_m), lambda i: (0, i))
     left, right = pl.pallas_call(
-        functools.partial(_gdp_kernel_split_cm, activation=activation),
+        functools.partial(_gdp_kernel_split_cm, activation=activation, chunk=_STREAM[2] if stream else None),
         grid=(Mp // block_m,), in_specs=split_in, out_specs=[bs, bs],
         out_shape=[jax.ShapeDtypeStruct((ci, Mp), x.dtype),
                    jax.ShapeDtypeStruct((ci, Mp), x.dtype)],
@@ -178,6 +220,9 @@ def ln_gated_dual_proj(x, ln_scale, ln_offset, wp, bp, wg, bg, mask, *, eps=1e-5
   """
   K = x.shape[-1]
   ci = wp.shape[1] // 2
+  # past 128 channels the weights stream by output column
+  chunk = None if epilogue_supported(K, ci, ci) else _STREAM[2]
+  block_m, num_warps = (_STREAM[0], _STREAM[1]) if chunk else (block_m, 4)
   dtype = jnp.float8_e4m3fn if fp8 else x.dtype
   halves = [t for w, b in ((wp, bp), (wg, bg)) for t in (w[:, :ci], b[:ci])]
   halves += [t for w, b in ((wp, bp), (wg, bg)) for t in (w[:, ci:], b[ci:])]
@@ -216,13 +261,13 @@ def ln_gated_dual_proj(x, ln_scale, ln_offset, wp, bp, wg, bg, mask, *, eps=1e-5
     out_shape = [jax.ShapeDtypeStruct((ci, M), dtype)] * 2
   left, right = pl.pallas_call(
       functools.partial(_ln_gdp_kernel, activation=jax.nn.sigmoid, eps=eps, m=m, block_m=block_m,
-                        row_axis=row_axis, m_out=m_out, fp8=fp8),
+                        row_axis=row_axis, m_out=m_out, fp8=fp8, chunk=chunk),
       grid=grid,
       in_specs=[xspec, vec(K), vec(K)] + [wspec, vec(ci)] * 4 + [mspec],
       out_specs=[out, out],
       out_shape=out_shape,
       # swept on the L40S: 15% faster than 128 rows x 8 warps
-      compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=1), name="ln_gated_dual_proj",
+      compiler_params=plgpu.CompilerParams(num_warps=num_warps, num_stages=1), name="ln_gated_dual_proj",
   )(x, ln_scale, ln_offset, *halves, mask)
   return left, right
 
@@ -268,6 +313,33 @@ def _epilogue_kernel(x_ref, a_ref, s_ref, o_ref_ln, wo_ref, bo_ref, wg_ref, bg_r
   plgpu.store(o_ref, out.astype(o_ref.dtype), mask=rows[:, None])
 
 
+def _epilogue_stream_kernel(x_ref, a_ref, s_ref, o_ref_ln, wo_ref, bo_ref, wg_ref, bg_ref, *rest,
+                            eps, m, block_m, chunk, input_ln=False, add_input=False):
+  # _epilogue_kernel for widths whose whole weights do not fit: the normed rows stay, the output columns stream
+  as_ref, ao_ref = rest[:2] if input_ln else (None, None)
+  rest = rest[2:] if input_ln else rest
+  r_ref, o_ref = rest if len(rest) == 2 else (None, rest[0])
+  rows = (pl.program_id(0) * block_m + jnp.arange(block_m)) < m
+  x = plgpu.load(x_ref, mask=rows[None, :], other=0.0).astype(jnp.float32).T
+  y = ln_rows(x, s_ref, o_ref_ln, eps).astype(wo_ref.dtype)
+  a = plgpu.load(a_ref, mask=rows[:, None], other=0.0)
+  if input_ln:
+    a = ln_rows(a.astype(jnp.float32), as_ref, ao_ref, eps).astype(a_ref.dtype)
+
+  def body(j, carry):
+    js = pl.ds(pl.multiple_of(j * chunk, chunk), chunk)
+    out = _dot(y, wo_ref[:, js]) + bo_ref[js][None, :].astype(jnp.float32)
+    out = out * sigmoid(_dot(a, wg_ref[:, js]) + bg_ref[js][None, :].astype(jnp.float32))
+    if r_ref is not None:
+      out = out + plgpu.load(r_ref.at[:, js], mask=rows[:, None], other=0.0).astype(jnp.float32)
+    if add_input:
+      out = out + plgpu.load(a_ref.at[:, js], mask=rows[:, None], other=0.0).astype(jnp.float32)
+    plgpu.store(o_ref.at[:, js], out.astype(o_ref.dtype), mask=rows[:, None])
+    return carry
+
+  jax.lax.fori_loop(0, o_ref.shape[1] // chunk, body, 0)
+
+
 def epilogue_supported(c, ca, o):
   """Whole-tile dots: power-of-two widths of at least 16 (Triton's dot K), at most 128 (shared memory)."""
   return all(w & (w - 1) == 0 and 16 <= w <= 128 for w in (c, ca, o))
@@ -286,7 +358,7 @@ def trimul_epilogue(x_cm, act, ln_scale, ln_offset, wo, bo, wg, bg, residual=Non
   c, m = x_cm.shape
   ca, o = act.shape[1], wo.shape[1]
   dtype = act.dtype if residual is None else residual.dtype
-  if not epilogue_supported(c, ca, o):
+  if not (epilogue_supported(c, ca, o) or stream_supported(c, ca, o)):
     return ref_trimul_epilogue(x_cm, act, ln_scale, ln_offset, wo, bo, wg, bg, residual, eps=eps).astype(dtype)
   extra = [] if residual is None else [residual]
   return _epilogue(x_cm, act, [ln_scale, ln_offset, wo, bo, wg, bg], extra, dtype, eps=eps, block_m=block_m,
@@ -297,10 +369,19 @@ def _epilogue(x_cm, act, params, extra, dtype, *, eps, block_m, num_warps, num_s
               add_input=False):
   c, m = x_cm.shape
   ca, o = act.shape[1], params[2].shape[1]
+  stream = not epilogue_supported(c, ca, o)
+  if stream:
+    (block_m, num_warps, chunk), num_stages = _STREAM, 1
+    # Triton on NVIDIA stages ~5 bytes a row and channel in shared memory (64 rows x 512: 160 KB): rows to fit the card
+    smem = None if is_rocm() else shared_memory_limit()
+    while smem and block_m > 16 and block_m * max(c, ca, o) * 5 > smem:
+      block_m //= 2
+  kernel = functools.partial(_epilogue_stream_kernel if stream else _epilogue_kernel, eps=eps, m=m, block_m=block_m,
+                             input_ln=input_ln, add_input=add_input, **({"chunk": chunk} if stream else {}))
   vec = lambda n: pl.BlockSpec((n,), lambda i: (0,))
   rows = pl.BlockSpec((block_m, o), lambda i: (i, 0))
   return pl.pallas_call(
-      functools.partial(_epilogue_kernel, eps=eps, m=m, block_m=block_m, input_ln=input_ln, add_input=add_input),
+      kernel,
       grid=(pl.cdiv(m, block_m),),
       in_specs=[pl.BlockSpec((c, block_m), lambda i: (0, i)),
                 pl.BlockSpec((block_m, ca), lambda i: (i, 0)), vec(c), vec(c),
@@ -322,7 +403,7 @@ def trimul_epilogue_ln(x_cm, x, in_scale, in_offset, ln_scale, ln_offset, wo, bo
   add_input adds x, the module's residual update, from the tile already loaded.
   """
   c, ca, o = x_cm.shape[0], x.shape[1], wo.shape[1]
-  if not epilogue_supported(c, ca, o):
+  if not (epilogue_supported(c, ca, o) or stream_supported(c, ca, o)):
     return ref_trimul_epilogue_ln(x_cm, x, in_scale, in_offset, ln_scale, ln_offset, wo, bo, wg, bg, eps=eps,
                                   add_input=add_input).astype(x.dtype)
   return _epilogue(x_cm, x, [ln_scale, ln_offset, wo, bo, wg, bg, in_scale, in_offset], [], x.dtype, eps=eps,

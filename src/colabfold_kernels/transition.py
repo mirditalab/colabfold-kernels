@@ -144,7 +144,7 @@ def _glu_kernel(x_ref, s_ref, o_ref_ln, wa_ref, wb_ref, wo_ref, *refs, eps, m, b
 
 
 def glu_supported(c, hdim):
-  return c & (c - 1) == 0 and 16 <= c <= 128 and hdim % 64 == 0
+  return c & (c - 1) == 0 and 16 <= c <= 512 and hdim % 64 == 0
 
 
 @functools.partial(jax.jit, static_argnames=("eps", "add_input", "activation", "block_m", "chunk", "num_warps",
@@ -160,6 +160,10 @@ def fused_glu_transition(x, ln_scale, ln_offset, wa, wb, wo, keep=None, *, eps=1
   # swept on sm_120 at 832 tokens: 128 channels 1.00 ms vs 2.06 unfused, 64 channels 0.20 vs 0.71;
   # ROCm takes the AF2 transition's tiles, three 128-channel stages would not fit gfx1151's 64 KB
   wide = c >= 128 and not is_rocm()
+  if c > 128:
+    # the fp32 [block_m, C] accumulator takes the registers: 32 rows x 4 warps, swept on gfx1151 at 256 tokens
+    # (256 channels: 8.4 against XLA's 40 ms, 512: 91 against 148)
+    block_m, num_warps, num_stages = block_m or 32, num_warps or 4, num_stages or 1
   block_m = block_m or (128 if wide else 64)
   num_warps = num_warps or (8 if wide else 4)
   num_stages = num_stages or (3 if wide else 1)

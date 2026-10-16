@@ -70,7 +70,7 @@ for M, C, F in ((4096, 128, 4), (777, 64, 4), (1000, 256, 4), (300, 64, 2), (1, 
           lambda *a, add=add: ref_transition(*a, add_input=add), args, list(range(7)))
 
 # AF3's swish-GLU transition, with OpenFold3's row mask and the residual
-for M, C in ((4096, 128), (777, 64), (1, 128), (127, 128), (64, 64)):
+for M, C in ((4096, 128), (777, 64), (1, 128), (127, 128), (64, 64), (777, 256), (127, 512)):
   glu = fused_ops.glu_transition(gc, dt, C, 4 * C)
   args = (f(M, C), 1 + f32(C, s=.1), f32(C, s=.1), f(C, 4 * C, s=C ** -.5), f(C, 4 * C, s=C ** -.5),
           f(4 * C, C, s=(4 * C) ** -.5))
@@ -82,10 +82,10 @@ for M, C in ((4096, 128), (777, 64), (1, 128), (127, 128), (64, 64)):
             lambda *a, add=add: glu(*a, add_input=add), lambda *a, add=add: ref_glu_transition(*a, add_input=add),
             a, list(range(6)))
 
-# AF2's fp16 path hands the epilogue a float32 product; a width the kernel does not take (96) runs XLA
+# AF2's fp16 path hands the epilogue a float32 product; a width the kernel does not take (96) runs XLA, 256 and 512 stream
 ep = fused_ops.trimul_epilogue(gc, dt)
 for M, C, xdt in ((4096, 128, dt), (999, 128, dt), (500, 64, dt), (1, 128, dt), (64, 128, dt), (127, 128, dt),
-                  (999, 128, jnp.float32), (300, 96, dt)):
+                  (999, 128, jnp.float32), (300, 96, dt), (999, 256, dt), (127, 512, dt)):
   args = (f(C, M).astype(xdt), f(M, C), 1 + f32(C, s=.1), f32(C, s=.1), f(C, C, s=C ** -.5), f(C, s=.1),
           f(C, C, s=C ** -.5), f(C, s=.1))
   tag = f"{M}x{C}{' f32 x' if xdt == jnp.float32 else ''}"

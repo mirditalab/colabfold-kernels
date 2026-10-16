@@ -76,6 +76,21 @@ for a, ci, n in ((16, 16, 16), (64, 64, 64)):
         [f(m, n), f(n, a, s=.1), f(a, s=.1), x], [0, 1])
 assert fused_ops.ln_projection(gc, dt, 8, 64) is None and fused_ops.output_projection(gc, dt, 64, 8) is None
 
+# past 128 channels (protenix2's 256-channel pair) the weights stream by output column; the epilogue to 512
+for a, ci, m in ((256, 256, 4101), (256, 128, 59), (128, 256, 777)):
+  x, sc, of = f(m, a, s=2.), f32(a), f32(a)
+  mask = jnp.asarray((rng.uniform(size=m) > .1).astype(np.float32), dt)
+  check(f"ln_gdp streamed a={a} ci={ci} m={m}", fused_ops.ln_gated_dual_proj(gc, dt, a, ci), tm.ref_ln_gdp,
+        [x, sc, of, f(a, 2 * ci, s=.1), f(2 * ci, s=.1), f(a, 2 * ci, s=.1), f(2 * ci, s=.1), mask], [0, 3])
+for a, ci, m in ((256, 256, 4101), (512, 512, 127)):
+  x, sc, of = f(m, a, s=2.), f32(a), f32(a)
+  ep = [f32(ci), f32(ci), f(ci, a, s=.1), f(a, s=.1), f(a, a, s=.1), f(a, s=.1)]
+  for add in (False, True):
+    check(f"epilogue_ln streamed a={a} m={m} add_input={add}",
+          lambda *z, add=add: fused_ops.trimul_epilogue_ln(gc, dt)(*z, add_input=add),
+          lambda *z, add=add: tm.ref_trimul_epilogue_ln(*z, add_input=add), [f(ci, m, s=2.), x, sc, of, *ep], [0, 1])
+assert fused_ops.ln_gated_dual_proj(gc, dt, 512, 512) is None
+
 # the MSA stack's 256 channels: the weight streamed in 64-row blocks
 for k, c in ((256, 256), (64, 256), (256, 128)):
   m = 4101
