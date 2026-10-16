@@ -191,6 +191,17 @@ def output_projection(global_config, dtype, num_input, num_output):
   return differentiable_via(pa.output_projection, pa.ref_output_projection)
 
 
+def opm_update(global_config, dtype, num_inner, num_output):
+  """-> f(lhs, t, bias, norm, residual=None, *, eps) or None: the shallow outer product mean's whole pair update."""
+  if not _pallas_half(global_config, dtype):
+    return None
+  from colabfold_kernels.grads import differentiable_via
+  from colabfold_kernels import opm
+  if not opm.supported(num_inner, num_output):
+    return None
+  return differentiable_via(opm.opm_update, opm.ref_opm_update, nondiff=('eps',))
+
+
 def layer_norm(global_config, dtype):
   """-> f(x, scale, offset, *, eps) or None. Last-axis, scale+offset only."""
   import jax.numpy as jnp
