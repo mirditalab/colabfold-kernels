@@ -38,6 +38,9 @@ def _load(kernel, cc, symbols):
         _LOADED[key] = False
         return False
     lib = ctypes.cdll.LoadLibrary(path)
+    if not all(hasattr(lib, sym) for sym in symbols):
+        _LOADED[key] = False    # a build older than the symbol
+        return False
     for sym in symbols:
         jax.ffi.register_ffi_target(
             sym, jax.ffi.pycapsule(getattr(lib, sym)), platform="CUDA")
@@ -269,3 +272,137 @@ def volta_gated_dual_proj(x, wp, bp, wg, bg, mask, cc, *, split=False,
         # XLA would transpose row-major halves for the einsum anyway.
         halves = [h.T for h in halves]
     return halves[0], halves[1]
+
+
+# The LayerNorm-fused projections take the widths AF2 uses: pair 128, template stack 64.
+FUSED_WIDTHS = (64, 128)
+# The per-head attention bias is a row reduction in the kernel, for at most this many heads.
+_MAX_BIAS_HEADS = 8
+_FUSED_SYMBOLS = {"ln_gated_dual_proj": "VoltaLnGdp", "trimul_epilogue": "VoltaTrimulEpilogue",
+                  "ln_projection": "VoltaLnProj", "output_projection": "VoltaOutProj",
+                  "transition": "VoltaTransition"}
+# The transition kernel holds the hidden activation in chunks of this many columns.
+_HIDDEN_CHUNK = 64
+
+
+def _fused_symbol(name, cc):
+    return name if cc >= 75 else name + "Wmma"
+
+
+def fused_available(cc, kernel):
+    """True if the legacy library has this fused kernel (a key of _FUSED_SYMBOLS) for the device."""
+    return _load(kernel, cc, (_fused_symbol(_FUSED_SYMBOLS[kernel], cc),))
+
+
+def ln_gdp_supported(num_channel, num_intermediate):
+    return num_channel in FUSED_WIDTHS and num_intermediate in FUSED_WIDTHS
+
+
+def projection_supported(*widths):
+    return all(w in FUSED_WIDTHS for w in widths)
+
+
+def transition_supported(num_channel, num_intermediate):
+    """AF2's transitions: factor 4 in the pair stack, 2 in the template stack."""
+    return num_channel in FUSED_WIDTHS and num_intermediate in (2 * num_channel, 4 * num_channel)
+
+
+f16 = lambda t: t.astype(jnp.float16)
+f32 = lambda t: t.astype(jnp.float32)
+
+
+@functools.partial(jax.jit, static_argnames=("sym", "eps"))
+def _ln_gdp_call(x, scale, offset, wp, bp, wg, bg, mask, *, sym, eps):
+    # the kernels stream the weights transposed, [P, K]
+    half = jax.ShapeDtypeStruct((wp.shape[1] // 2, x.shape[0]), jnp.float16)
+    return jax.ffi.ffi_call(sym, (half, half), vmap_method="sequential")(
+        f16(x), f32(scale), f32(offset), f16(wp.T), f16(bp), f16(wg.T), f16(bg), f16(mask),
+        eps=np.float32(eps))
+
+
+def volta_ln_gated_dual_proj(x, ln_scale, ln_offset, wp, bp, wg, bg, mask, *, eps=1e-5, cc):
+    """tri_mul.ln_gated_dual_proj for sm_70/75: left, right [P/2, M] channel major from one read of x [M, K]."""
+    left, right = _ln_gdp_call(x, ln_scale, ln_offset, wp, bp, wg, bg, mask,
+                               sym=_fused_symbol("VoltaLnGdp", cc), eps=eps)
+    return left.astype(x.dtype), right.astype(x.dtype)
+
+
+@functools.partial(jax.jit, static_argnames=("sym", "eps", "add_input"))
+def _epilogue_call(x_cm, x, in_scale, in_offset, ln_scale, ln_offset, wo, bo, wg, bg, *, sym, eps, add_input):
+    out = jax.ShapeDtypeStruct((x.shape[0], wo.shape[1]), jnp.float16)
+    return jax.ffi.ffi_call(sym, out, vmap_method="sequential")(
+        f32(x_cm), f16(x), f32(in_scale), f32(in_offset), f32(ln_scale), f32(ln_offset),
+        f16(wo.T), f16(bo), f16(wg.T), f16(bg), eps=np.float32(eps), add_input=add_input)
+
+
+def volta_trimul_epilogue_ln(x_cm, x, in_scale, in_offset, ln_scale, ln_offset, wo, bo, wg, bg, *, eps=1e-5,
+                             add_input=False, cc):
+    """tri_mul.trimul_epilogue_ln for sm_70/75. Widths the kernel does not take run the reference in XLA."""
+    c, ca, o = x_cm.shape[0], x.shape[1], wo.shape[1]
+    if not projection_supported(c, ca, o) or (add_input and o != ca):
+        from colabfold_kernels.tri_mul import ref_trimul_epilogue_ln
+        return ref_trimul_epilogue_ln(x_cm, x, in_scale, in_offset, ln_scale, ln_offset, wo, bo, wg, bg, eps=eps,
+                                      add_input=add_input).astype(x.dtype)
+    out = _epilogue_call(x_cm, x, in_scale, in_offset, ln_scale, ln_offset, wo, bo, wg, bg,
+                         sym=_fused_symbol("VoltaTrimulEpilogue", cc), eps=eps, add_input=add_input)
+    return out.astype(x.dtype)
+
+
+@functools.partial(jax.jit, static_argnames=("sym", "eps"))
+def _ln_proj_call(x, scale, offset, w, wb, *, sym, eps):
+    m, a = x.shape
+    n = 0 if w is None else w.shape[0] * w.shape[2]
+    heads = 0 if wb is None else wb.shape[1]
+    # an absent result is a one-element buffer the kernel leaves alone
+    unused = jnp.zeros((1,), jnp.float16)
+    wt = unused if w is None else f16(jnp.swapaxes(w, 1, 2).reshape(n, a))
+    wbt = unused if wb is None else f16(wb.T)
+    shapes = (jax.ShapeDtypeStruct((m, n) if n else (1,), jnp.float16),
+              jax.ShapeDtypeStruct((heads, m) if heads else (1,), jnp.float16))
+    p, bias = jax.ffi.ffi_call(sym, shapes, vmap_method="sequential")(
+        f16(x), f32(scale), f32(offset), wt, wbt, eps=np.float32(eps), n=np.int64(n), heads=np.int64(heads))
+    return (p if n else None), (bias if heads else None)
+
+
+def volta_ln_projection(x, ln_scale, ln_offset, w=None, wb=None, *, eps=1e-5, f8_slots=(), cc):
+    """packed_attn.ln_projection for sm_70/75: (p [M, G*n], bias [h, M]) from one read of x [M, a]."""
+    if f8_slots:
+        raise ValueError("e4m3 slots need compute capability 8.9, not the sm_70/75 kernels")
+    if wb is not None and wb.shape[1] > _MAX_BIAS_HEADS:
+        from colabfold_kernels.packed_attn import ref_ln_projection
+        out = ref_ln_projection(x, ln_scale, ln_offset, w, wb, eps=eps)
+    else:
+        out = _ln_proj_call(x, ln_scale, ln_offset, w, wb, sym=_fused_symbol("VoltaLnProj", cc), eps=eps)
+    return tuple(None if t is None else t.astype(x.dtype) for t in out)
+
+
+@functools.partial(jax.jit, static_argnames=("sym",))
+def _out_proj_call(o, w, b, residual, *, sym):
+    res = jnp.zeros((1,), jnp.float16) if residual is None else f16(residual)
+    out = jax.ShapeDtypeStruct((o.shape[0], w.shape[1]), jnp.float16)
+    return jax.ffi.ffi_call(sym, out, vmap_method="sequential")(
+        f16(o), f16(w.T), f16(b), res, has_residual=residual is not None)
+
+
+def volta_output_projection(o, w, b, residual=None, *, cc):
+    """packed_attn.output_projection for sm_70/75: o [M, k] @ w [k, c] + b, plus residual, in one pass."""
+    out = _out_proj_call(o, w, b, residual, sym=_fused_symbol("VoltaOutProj", cc))
+    return out.astype(o.dtype if residual is None else residual.dtype)
+
+
+@functools.partial(jax.jit, static_argnames=("sym", "eps", "add_input"))
+def _transition_call(x, scale, offset, w1, b1, w2, b2, *, sym, eps, add_input):
+    h, c = w2.shape
+    # w2 as row chunks of the hidden dim, each transposed, so a chunk is one [c, chunk] tile
+    w2t = jnp.swapaxes(w2.reshape(h // _HIDDEN_CHUNK, _HIDDEN_CHUNK, c), 1, 2)
+    return jax.ffi.ffi_call(sym, jax.ShapeDtypeStruct(x.shape, jnp.float16), vmap_method="sequential")(
+        f16(x), f32(scale), f32(offset), f16(w1.T), f16(b1), f16(w2t), f16(b2),
+        eps=np.float32(eps), add_input=add_input)
+
+
+def volta_transition(x, ln_scale, ln_offset, w1, b1, w2, b2, *, eps=1e-5, add_input=False, cc):
+    """transition.fused_transition for sm_70/75: relu(LN(x) @ w1 + b1) @ w2 + b2 (+ x), x [..., C]."""
+    c = x.shape[-1]
+    out = _transition_call(x.reshape(-1, c), ln_scale, ln_offset, w1, b1, w2, b2,
+                           sym=_fused_symbol("VoltaTransition", cc), eps=eps, add_input=add_input)
+    return out.reshape(x.shape).astype(x.dtype)

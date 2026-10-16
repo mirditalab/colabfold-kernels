@@ -30,6 +30,14 @@ def register_ffi_targets(global_config):
     contract.available()
 
 
+def _legacy_half(global_config, dtype):
+  """The compute capability when the CUDA kernels were asked for and dtype is float16, else None."""
+  import jax.numpy as jnp
+  if not global_config.get('use_pallas', False) or dtype != jnp.float16:
+    return None
+  return _legacy_cc(global_config)
+
+
 def attention(global_config, dtype, key_dim, value_dim, layout='heads'):
   """-> f(q, k, v, mask_bias, nonbatched_bias, scale) or None.
 
@@ -164,6 +172,15 @@ def packed_attention(global_config, dtype, key_dim, value_dim):
 
 def transition(global_config, dtype, num_channel, num_intermediate):
   """-> f(x, ln_scale, ln_offset, w1, b1, w2, b2, keep=None, *, eps) or None: the whole LN-MLP transition."""
+  cc = _legacy_half(global_config, dtype)
+  if cc is not None:
+    from colabfold_kernels import transition as t
+    from colabfold_kernels.grads import differentiable_via
+    va = _volta()
+    if not (va.transition_supported(num_channel, num_intermediate) and va.fused_available(cc, 'transition')):
+      return None
+    return differentiable_via(functools.partial(va.volta_transition, cc=cc), t.ref_transition,
+                              nondiff=('eps', 'add_input'))
   if not _pallas_half(global_config, dtype):
     return None
   from colabfold_kernels import transition as t
@@ -195,6 +212,14 @@ def trimul_epilogue(global_config, dtype):
 
 def trimul_epilogue_ln(global_config, dtype):
   """-> f(x_cm, x, in_scale, in_offset, ln_scale, ln_offset, wo, bo, wg, bg, *, eps, add_input) or None."""
+  cc = _legacy_half(global_config, dtype)
+  if cc is not None:
+    from colabfold_kernels.grads import differentiable_via
+    from colabfold_kernels import tri_mul
+    if not _volta().fused_available(cc, 'trimul_epilogue'):
+      return None
+    return differentiable_via(functools.partial(_volta().volta_trimul_epilogue_ln, cc=cc),
+                              tri_mul.ref_trimul_epilogue_ln, nondiff=('eps', 'add_input'))
   if not _pallas_half(global_config, dtype):
     return None
   from colabfold_kernels.grads import differentiable_via
@@ -204,6 +229,17 @@ def trimul_epilogue_ln(global_config, dtype):
 
 def ln_gated_dual_proj(global_config, dtype, num_channel, num_intermediate):
   """-> f(x, ln_scale, ln_offset, wp, bp, wg, bg, mask, *, eps) -> (left, right) channel major, or None."""
+  cc = _legacy_half(global_config, dtype)
+  if cc is not None:
+    from colabfold_kernels.grads import differentiable_via
+    from colabfold_kernels import tri_mul
+    va = _volta()
+    # the module follows it with trimul_epilogue_ln, so the library needs both
+    if not (va.ln_gdp_supported(num_channel, num_intermediate) and va.fused_available(cc, 'ln_gated_dual_proj')
+            and va.fused_available(cc, 'trimul_epilogue')):
+      return None
+    return differentiable_via(functools.partial(va.volta_ln_gated_dual_proj, cc=cc), tri_mul.ref_ln_gdp,
+                              nondiff=('eps',))
   if not _pallas_half(global_config, dtype):
     return None
   from colabfold_kernels.grads import differentiable_via
@@ -236,6 +272,16 @@ def ln_projection(global_config, dtype, num_channel, num_output=None):
 
   num_output is the width of each packed slot, None when only the bias is projected.
   """
+  cc = _legacy_half(global_config, dtype)
+  if cc is not None:
+    from colabfold_kernels.grads import differentiable_via
+    from colabfold_kernels import packed_attn as pa
+    va = _volta()
+    if not (va.projection_supported(num_channel, *([] if num_output is None else [num_output]))
+            and va.fused_available(cc, 'ln_projection')):
+      return None
+    return differentiable_via(functools.partial(va.volta_ln_projection, cc=cc), pa.ref_ln_projection,
+                              nondiff=('eps', 'f8_slots'))
   if not _pallas_half(global_config, dtype):
     return None
   from colabfold_kernels.grads import differentiable_via
@@ -252,6 +298,14 @@ def ln_projection(global_config, dtype, num_channel, num_output=None):
 
 def output_projection(global_config, dtype, num_input, num_output):
   """-> f(o, w, b, residual=None) or None: the attention output projection with its residual update."""
+  cc = _legacy_half(global_config, dtype)
+  if cc is not None:
+    from colabfold_kernels.grads import differentiable_via
+    from colabfold_kernels import packed_attn as pa
+    va = _volta()
+    if not (va.projection_supported(num_input, num_output) and va.fused_available(cc, 'output_projection')):
+      return None
+    return differentiable_via(functools.partial(va.volta_output_projection, cc=cc), pa.ref_output_projection)
   if not _pallas_half(global_config, dtype):
     return None
   from colabfold_kernels.grads import differentiable_via
