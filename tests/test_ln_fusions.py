@@ -60,6 +60,47 @@ for m in (1, 59, 4101, 260 * 260):
   check(f"output_projection m={m}", op, pa.ref_output_projection, [o, wo, bo, x], [0, 1, 3])
   check(f"output_projection no residual m={m}", op, pa.ref_output_projection, [o, wo, bo], [0, 1])
 
+# the narrowest widths the kernels take (Triton's dot K is 16) and the template stack's 64 channels, 4 heads of 16
+for a, ci, n in ((16, 16, 16), (64, 64, 64)):
+  m = 4101
+  x, sc, of = f(m, a, s=2.), f32(a), f32(a)
+  mask = jnp.asarray((rng.uniform(size=m) > .1).astype(np.float32), dt)
+  check(f"ln_gdp a={a} ci={ci}", fused_ops.ln_gated_dual_proj(gc, dt, a, ci), tm.ref_ln_gdp,
+        [x, sc, of, f(a, 2 * ci, s=.1), f(2 * ci, s=.1), f(a, 2 * ci, s=.1), f(2 * ci, s=.1), mask], [0, 3])
+  ep = [f32(ci), f32(ci), f(ci, a, s=.1), f(a, s=.1), f(a, a, s=.1), f(a, s=.1)]
+  check(f"epilogue_ln a={a} ci={ci}", lambda *z: fused_ops.trimul_epilogue_ln(gc, dt)(*z, add_input=True),
+        lambda *z: tm.ref_trimul_epilogue_ln(*z, add_input=True), [f(ci, m, s=2.), x, sc, of, *ep], [0, 1])
+  check(f"ln_projection a={a} n={n}", fused_ops.ln_projection(gc, dt, a, n), pa.ref_ln_projection,
+        [x, sc, of, f(4, a, n, s=.1), f(a, 4, s=.1)], [0, 3])
+  check(f"output_projection k={n} c={a}", fused_ops.output_projection(gc, dt, n, a), pa.ref_output_projection,
+        [f(m, n), f(n, a, s=.1), f(a, s=.1), x], [0, 1])
+assert fused_ops.ln_projection(gc, dt, 8, 64) is None and fused_ops.output_projection(gc, dt, 64, 8) is None
+
+# the MSA stack's 256 channels: the weight streamed in 64-row blocks
+for k, c in ((256, 256), (64, 256), (256, 128)):
+  m = 4101
+  check(f"output_projection k={k} c={c}", fused_ops.output_projection(gc, dt, k, c), pa.ref_output_projection,
+        [f(m, k), f(k, c, s=.06), f(c, s=.1), f(m, c)], [0, 1])
+assert fused_ops.output_projection(gc, dt, 96, 256) is None and fused_ops.output_projection(gc, dt, 256, 512) is None
+# and the MSA attention's query LayerNorm with its 256-wide slots, in 128-column dots
+for a, n, slots in ((256, 256, 4), (256, 256, 3), (256, 128, 4)):
+  m = 4101
+  x, sc, of = f(m, a, s=2.), f32(a), f32(a)
+  check(f"ln_projection a={a} n={n} slots={slots}", fused_ops.ln_projection(gc, dt, a, n), pa.ref_ln_projection,
+        [x, sc, of, f(slots, a, n, s=.06), None], [0, 3])
+assert fused_ops.ln_projection(gc, dt, 512, 128) is None and fused_ops.ln_projection(gc, dt, 256, 192) is None
+
+# the shallow outer product mean's update: K is 32 per MSA row, norm 0 on padding (only eps divides then)
+from colabfold_kernels import opm
+for b, rows in ((59, 1), (259, 1), (259, 16)):
+  kk = 32 * rows
+  lhs, t, ob = f(b, kk), f(kk, b, 128, s=.2), f(128, s=.1)
+  norm = jnp.asarray((rng.uniform(size=(b, b)) > .1).astype(np.float32) * rows, dt)
+  up = fused_ops.opm_update(gc, dt, kk, 128)
+  check(f"opm_update b={b} rows={rows}", up, opm.ref_opm_update, [lhs, t, ob, norm, f(b, b, 128)], [0, 1, 4])
+  check(f"opm_update b={b} rows={rows} no residual", up, opm.ref_opm_update, [lhs, t, ob, norm], [0, 1])
+assert fused_ops.opm_update(gc, dt, 48, 128) is None and fused_ops.opm_update(gc, dt, 32, 96) is None
+
 # the unfused path is exactly what the fused one replaces: LN, then the existing kernels
 m = 4101
 x, sc, of = f(m, 128, s=2.), f32(128), f32(128)
@@ -72,6 +113,76 @@ same = all(np.array_equal(np.asarray(a, np.float32), np.asarray(b, np.float32)) 
 diff = max(rel(a, b) for a, b in zip(new, old))
 print(f"{'ok ' if diff < 1e-2 else 'BAD'} ln_gdp vs layer_norm + gdp: {'bitwise' if same else f'{diff:.2e}'}")
 bad += diff >= 1e-2
+
+# e4m3, on cards with 8-bit MMAs only: errors at its 3-bit mantissa
+def rms(a, b):
+  a, b = np.asarray(a, np.float64), np.asarray(b, np.float64)
+  return float(np.sqrt(np.mean((a - b) ** 2) / np.mean(b ** 2))) if np.isfinite(a).all() else float('inf')
+
+def expect(name, ok, detail):
+  global bad
+  bad += not ok
+  print(f"{'ok ' if ok else 'BAD'} {name}: {detail}")
+
+from colabfold_kernels.device import compute_capability, is_rocm
+if (compute_capability() or 0) >= 89 and not is_rocm():
+  from colabfold_kernels.tri_flash import e4m3
+  for n, d in ((259, 32), (130, 64)):
+    p, bias, gb = f(n, n, 4, 4, d, s=1.), f(4, n, n), f(4, d)
+    kmask = jnp.asarray(rng.uniform(size=(n, n)) > .1)
+    for column in (False, True):
+      kw = dict(sm_scale=d ** -0.5, column=column)
+      o8 = pa.packed_attention(p[:, :, jnp.array([0, 3])], bias, kmask, gb, e4m3(p[:, :, 1:3]), **kw)
+      # e4m3 rounds q and k by ~3% each, so the logits and their softmax move by about that much
+      e = rms(o8, pa.ref_packed_attention(p, bias, kmask, gb, **kw))
+      expect(f"fp8 attention n={n} d={d} column={column}", e < 0.08, f"rms {e:.2e}")
+  # an 8-bit MMA's K is 32: narrower heads are never offered e4m3
+  expect("fp8 attention refused at head dims 8 and 16",
+         not any(fused_ops.fp8_attention({"fp8": True}, d) for d in (8, 16)), "")
+  expect("fp8 attention off where the Mosaic kernel runs",
+         fused_ops.fp8_attention({"fp8": True}, 32) == (fused_ops._mgpu_attn() is None), "")
+  m = 4101
+  x, sc, of = f(m, 128, s=2.), f32(128), f32(128)
+  w4, wb = f(4, 128, 128, s=.1), f(128, 4, s=.1)
+  p16, b16 = pa.ln_projection(x, sc, of, w4, wb)
+  ph, b8, p8 = pa.ln_projection(x, sc, of, w4, wb, f8_slots=(1, 2))
+  p16 = np.asarray(p16, np.float32).reshape(m, 4, 128)
+  # another compile of the same dots: a few elements move by one bf16 ulp
+  e = max(rel(np.asarray(ph, np.float32).reshape(m, 2, 128), p16[:, [0, 3]]), rel(b8, b16))
+  expect("ln_projection f8_slots: bf16 slots and bias", e < 1e-2, f"max rel {e:.2e}")
+  e = rms(np.asarray(p8, np.float32).reshape(m, 2, 128), p16[:, 1:3])
+  expect("ln_projection f8_slots: e4m3 slots", e < 0.05, f"rms {e:.2e}")
+  # the triangle contraction's e4m3 operands, padded to 16 along the contracted axis, plain and transposed
+  n, cz = 259, 128
+  x, mask = f(n, n, cz, s=2.), jnp.asarray((rng.uniform(size=(n, n)) > .1).astype(np.float32), dt)
+  g = [f32(cz), f32(cz), f(cz, 256, s=.1), f(256, s=.1), f(cz, 256, s=.1), f(256, s=.1)]
+  for transpose in (False, True):
+    out = tm.ln_gated_dual_proj(x, *g, mask, fp8=True, transpose=transpose, pad=16)
+    ref = tm.ref_ln_gdp(x, *g, mask, transpose=transpose, pad=16)
+    e = max(rms(a, b) for a, b in zip(out, ref))
+    zero = all(not np.asarray(o[:, :, n:], np.float32).any() for o in out)
+    expect(f"ln_gdp e4m3 3D transpose={transpose}", e < 0.05 and out[0].shape == (128, n, 272) and zero,
+           f"rms {e:.2e}, shape {out[0].shape}, padding zero {zero}")
+  from colabfold_kernels import contract
+  if contract.available():
+    a8, b8 = e4m3(f(128, n, 272, s=2.)), e4m3(f(128, 264, 272, s=2.))
+    e = rel(contract.fp8_contract(a8, b8), contract.ref_fp8_contract(a8, b8))
+    expect("fp8_contract vs e4m3-rounded inputs", e < 1e-2, f"max rel {e:.2e}")
+    assert fused_ops.fp8_contraction({"fp8": True, **gc}, dt, cz, 128, n) is None
+    n = 264
+    x, mask = f(n, n, cz, s=2.), jnp.asarray((rng.uniform(size=(n, n)) > .1).astype(np.float32), dt)
+    proj, con = fused_ops.fp8_contraction({"fp8": True, **gc}, dt, cz, 128, n)
+    for eq, transpose in (('ikc,jkc->ijc', False), ('kjc,kic->ijc', True)):
+      l, r = proj(x, *g, mask, transpose=transpose)
+      tri = con(*((r, l) if transpose else (l, r)))
+      l32, r32 = tm.ref_ln_gdp(x.reshape(-1, cz), *g, mask.reshape(-1))
+      ref = jnp.einsum(eq, *(t.T.reshape(n, n, 128) for t in (l32, r32))).transpose(2, 0, 1)
+      e = rms(tri, ref)
+      expect(f"fp8 triangle contraction {eq}", e < 0.05, f"rms {e:.2e}")
+  else:
+    print("no colabfold-cuda-kernels FP8 contraction here: not tested")
+else:
+  print("no 8-bit MMAs here: e4m3 paths not tested")
 
 print("FAILED" if bad else "all ok")
 sys.exit(bool(bad))
