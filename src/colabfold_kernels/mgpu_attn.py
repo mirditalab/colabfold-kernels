@@ -38,10 +38,13 @@ def _tiles(cols, itemsize):
   return plgpu.TilingTransform((8, w)), plgpu.SwizzleTransform(w * itemsize)
 
 
-@functools.partial(jax.jit, static_argnames=("sm_scale", "column", "C", "block_q", "block_k", "stages"))
+@functools.partial(jax.jit, static_argnames=("sm_scale", "column", "C", "block_q", "block_k", "stages", "group"))
 def packed_attention(p, bias, kmask, gate_bias=None, *, sm_scale, column=False, C=None, block_q=128,
-                     block_k=32, stages=None):
-  """p [X, Y, G, H, D], bias [H, S, S], kmask [batch, S], gate_bias [H, D] iff G == 4; rows attend along Y."""
+                     block_k=32, stages=None, group=None):
+  """p [X, Y, G, H, D], bias [H, S, S], kmask [batch, S], gate_bias [H, D] iff G == 4; rows attend along Y.
+
+  group batch groups run each query block back to back, so they read its bias tile from L2 once.
+  """
   X, Y, G, H, D = p.shape
   gated, dt = G == 4, p.dtype
   assert G in (3, 4) and (gate_bias is not None) == gated
@@ -53,6 +56,10 @@ def packed_attention(p, bias, kmask, gate_bias=None, *, sm_scale, column=False, 
   stages = stages or (3 if D <= 32 else 2)
   bq, bk = block_q, block_k
   nbg, nq, nk = -(-nb // C), -(-s // bq), -(-s // bk)
+  # sweep on sm_120 (4 heads of 32, 256 rows): 2 is level to 1,048 queries and best at 3,000, 8 best from 4,000
+  # (182 -> 240 TF/s there), as localfold switches at 3,500
+  group = min(group or (8 if s >= 3500 else 2), nbg)
+  nsg = -(-nbg // group)
   bias = jnp.pad(bias.astype(dt), [(0, 0), (0, nq * bq - s), (0, nk * bk - s)])
   # masked keys share NEG, keys past s get -inf: a fully masked row averages its s keys, as in tri_flash
   kadd = jnp.pad(jnp.where(kmask, 0., NEG).astype(jnp.float32), [(0, nbg * C - nb), (0, nk * bk - s)],
@@ -68,12 +75,16 @@ def packed_attention(p, bias, kmask, gate_bias=None, *, sm_scale, column=False, 
 
   def kernel(p_ref, bias_ref, kadd_ref, gb_ref, o_ref, buf, b_smem, k_smem, v_smem, ka_smem, gb_smem,
              q_bar, g_bar, produced, consumed):
-    # grid (batch group x head, query block): query blocks innermost, so a batch group's K/V stay in L2
-    bh, i, wg = lax.axis_index("bh"), lax.axis_index("q"), lax.axis_index("wg")
-    b0, h = lax.div(bh, H) * C, lax.rem(bh, H)
+    # grid (batch supergroup x head, query block x batch group): a query block's batch groups run adjacent and share
+    # its bias tile in L2, a supergroup's K/V stay there across its query blocks
+    sh, qg, wg = lax.axis_index("sh"), lax.axis_index("qg"), lax.axis_index("wg")
+    h, i = lax.rem(sh, H), lax.div(qg, group)
+    bg = lax.div(sh, H) * group + lax.rem(qg, group)
+    b0 = bg * C
     qrows = pl.ds(i * bq, bq)
 
-    @pl.when(wg < C)
+    # a supergroup past the batch groups has nothing to do
+    @pl.when((wg < C) & (bg < nbg))
     def _compute():
       plgpu.set_max_registers(regs, action="increase")
       b = jnp.minimum(b0 + wg, nb - 1)
@@ -123,7 +134,7 @@ def packed_attention(p, bias, kmask, gate_bias=None, *, sm_scale, column=False, 
         plgpu.copy_smem_to_gmem(buf.at[wg], rows_of(o_ref, b, h).at[qrows])
       plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
-    @pl.when(wg == C)
+    @pl.when((wg == C) & (bg < nbg))
     def _memory():
       plgpu.set_max_registers(24, action="decrease")
 
@@ -166,7 +177,7 @@ def packed_attention(p, bias, kmask, gate_bias=None, *, sm_scale, column=False, 
     )
 
   return plgpu.kernel(
-      entry, out_type=jax.ShapeDtypeStruct((X, Y, H, D), dt), grid=(nbg * H, nq), grid_names=("bh", "q"),
+      entry, out_type=jax.ShapeDtypeStruct((X, Y, H, D), dt), grid=(nsg * H, nq * group), grid_names=("sh", "qg"),
       num_threads=C + 1, thread_name="wg",
       compiler_params=plgpu.CompilerParams(lowering_semantics=plgpu.LoweringSemantics.Lane, approx_math=True),
   )(p, bias, kadd, gb)
