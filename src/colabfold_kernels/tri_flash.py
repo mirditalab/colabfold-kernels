@@ -45,8 +45,12 @@ def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, *rest,
   sk = k_ref.shape[0]
   # only a last chunk reaching past d needs a lane mask, and those lanes read zero
   cols = [None if off + w <= d else (off + jnp.arange(w)) < d for off, w in chunks]
-  qs = [q_ref[:, pl.dslice(off, w)] if c is None else
-        plgpu.load(q_ref.at[:, pl.dslice(off, w)], mask=c[None, :], other=0.0)
+  # the query rows past Sq are masked on the way in as well as out: the block is block_q rows wherever Sq ends, and
+  # in packed_attention's layout a row past the end of the last batch is past the end of p (column attention over
+  # one MSA row reads block_q - 1 rows of [Y, G, H, D] beyond it - an illegal address on a single-sequence fold)
+  q_valid = (pl.program_id(0) * block_q + jnp.arange(block_q)) < sq
+  qs = [plgpu.load(q_ref.at[:, pl.dslice(off, w)],
+                   mask=q_valid[:, None] if c is None else q_valid[:, None] & c[None, :], other=0.0)
         for (off, w), c in zip(chunks, cols)]
   m_i = jnp.full(block_q, -float('inf'), jnp.float32)
   l_i = jnp.zeros(block_q, jnp.float32)
@@ -63,7 +67,7 @@ def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, *rest,
       kc = plgpu.load(k_ref.at[sl, pl.dslice(off, w)], mask=m, other=0.0)
       part = _dot(qc, kc.T)                    # [block_q, block_k]
       qk = part if qk is None else qk + part
-    bias = plgpu.load(bias_ref.at[:, sl], mask=kb[None, :], other=0.0)
+    bias = plgpu.load(bias_ref.at[:, sl], mask=q_valid[:, None] & kb[None, :], other=0.0)
     qk = (qk * sm_scale + bias) * LOG2E
     km = plgpu.load(kmask_ref.at[sl], mask=kb, other=False)
     # masked keys share a finite floor; keys past Sk get none, so a fully masked row averages Sk keys
@@ -81,7 +85,6 @@ def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, *rest,
     return o_next, m_next, l_next
 
   os, m_i, l_i = jax.lax.fori_loop(0, pl.cdiv(sk, block_k), body, (os, m_i, l_i))
-  q_valid = (pl.program_id(0) * block_q + jnp.arange(block_q)) < sq
   if lse_ref is not None:
     # log2 domain, which is what the backward's exp2 wants
     plgpu.store(lse_ref, m_i + jnp.log2(l_i), mask=q_valid)
