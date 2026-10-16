@@ -19,7 +19,7 @@ classifiers = [
 ]
 dependencies = [
   "colabfold-legacy-kernels>=0.5.0,<0.6; sys_platform == 'linux' and platform_machine == 'x86_64'",
-  "colabfold-cuda-kernels>=0.1.0,<0.2; sys_platform == 'linux'",
+  "colabfold-cuda-kernels>=0.2.0,<0.3; sys_platform == 'linux'",
 ]
 [project.urls]
 Homepage = "https://github.com/mirditalab/colabfold-kernels"
