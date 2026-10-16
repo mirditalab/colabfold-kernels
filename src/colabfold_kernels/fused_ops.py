@@ -166,6 +166,22 @@ def ln_gated_dual_proj(global_config, dtype, num_channel, num_intermediate):
   return differentiable_via(tri_mul.ln_gated_dual_proj, tri_mul.ref_ln_gdp, nondiff=('eps',))
 
 
+def fp8_contraction(global_config, dtype, num_channel, num_intermediate, num_res):
+  """-> (projection, contract) or None: ln_gated_dual_proj writing its halves e4m3, padded to 16, and their
+  contraction through cuBLASLt's FP8 GEMM; global_config.fp8, on compute capability 8.9 on."""
+  if not global_config.get('fp8', False) or ln_gated_dual_proj(global_config, dtype, num_channel,
+                                                                num_intermediate) is None:
+    return None
+  from colabfold_kernels.grads import differentiable_via
+  from colabfold_kernels import contract, tri_mul
+  # the product's rows are num_res wide: cuBLASLt wants them 16 bytes (ColabFold pads the length to 8)
+  if not contract.supported(16, num_res) or not contract.available():
+    return None
+  proj = differentiable_via(functools.partial(tri_mul.ln_gated_dual_proj, fp8=True, pad=16),
+                            functools.partial(tri_mul.ref_ln_gdp, pad=16), nondiff=('eps', 'transpose'))
+  return proj, differentiable_via(contract.fp8_contract, contract.ref_fp8_contract)
+
+
 def ln_projection(global_config, dtype, num_channel, num_output=None):
   """-> f(x, ln_scale, ln_offset, w, wb, *, eps) -> (p, bias) or None: LayerNorm then the packed and bias projections.
 

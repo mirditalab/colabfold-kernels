@@ -16,6 +16,7 @@ from jax.experimental.pallas import triton as plgpu
 
 from colabfold_kernels.device import is_rocm
 from colabfold_kernels.transition import ln_rows, ref_ln
+from colabfold_kernels.tri_flash import e4m3
 
 # jnp.dot is stable across jax versions, contrary to pl.dot/plgpu.dot
 _dot = functools.partial(jnp.dot, preferred_element_type=jnp.float32)
@@ -55,16 +56,20 @@ def _gdp_kernel_split_cm(x_ref, wpl_ref, bpl_ref, wgl_ref, bgl_ref,
 
 
 def _ln_gdp_kernel(x_ref, s_ref, offset_ref, wpl_ref, bpl_ref, wgl_ref, bgl_ref,
-                   wpr_ref, bpr_ref, wgr_ref, bgr_ref, mask_ref, ol_ref, or_ref, *, activation, eps, m, block_m):
+                   wpr_ref, bpr_ref, wgr_ref, bgr_ref, mask_ref, ol_ref, or_ref, *, activation, eps, m, block_m,
+                   row_axis=0, m_out=None, fp8=False):
   # _gdp_kernel_split_cm on LN(x), so the normed pair never leaves the SM; rows past m are masked, not padded
-  rows = (pl.program_id(0) * block_m + jnp.arange(block_m)) < m
+  # m_out: rows written, past m zeros (their mask reads 0), the padding an FP8 GEMM's 16-byte rows want
+  row = pl.program_id(row_axis) * block_m + jnp.arange(block_m)
+  rows, out_rows = row < m, row < (m_out or m)
   x = plgpu.load(x_ref, mask=rows[:, None], other=0.0).astype(jnp.float32)
   x = ln_rows(x, s_ref, offset_ref, eps).astype(x_ref.dtype)
   mask = plgpu.load(mask_ref, mask=rows, other=0)
+  cast = e4m3 if fp8 else (lambda t: t.astype(ol_ref.dtype))
   left = _half(x, wpl_ref[...], bpl_ref[...], wgl_ref[...], bgl_ref[...], mask, activation)
-  plgpu.store(ol_ref, left.T.astype(ol_ref.dtype), mask=rows[None, :])
+  plgpu.store(ol_ref, cast(left.T), mask=out_rows[None, :])
   right = _half(x, wpr_ref[...], bpr_ref[...], wgr_ref[...], bgr_ref[...], mask, activation)
-  plgpu.store(or_ref, right.T.astype(or_ref.dtype), mask=rows[None, :])
+  plgpu.store(or_ref, cast(right.T), mask=out_rows[None, :])
 
 
 def _gdp_kernel_split(x_ref, wpl_ref, bpl_ref, wgl_ref, bgl_ref,
@@ -161,36 +166,82 @@ def gated_dual_proj(x, wp, bp, wg, bg, mask, *, block_m=None, split=False,
   return left[:M], right[:M]
 
 
-@functools.partial(jax.jit, static_argnames=("eps", "block_m"))
-def ln_gated_dual_proj(x, ln_scale, ln_offset, wp, bp, wg, bg, mask, *, eps=1e-5, block_m=64):
+@functools.partial(jax.jit, static_argnames=("eps", "block_m", "fp8", "transpose", "pad"))
+def ln_gated_dual_proj(x, ln_scale, ln_offset, wp, bp, wg, bg, mask, *, eps=1e-5, block_m=64, fp8=False,
+                       transpose=False, pad=1):
   """gated_dual_proj(LN(x), ..., split=True, channel_major=True) in one pass over the raw input x [M, K].
 
   Returns left, right [P/2, M]. K must be a power of two, the LayerNorm needs whole rows.
+  fp8 writes them e4m3, unscaled and saturating. The pair x [A, B, K] with mask [A, B] gives left, right
+  [P/2, A, B'], B' being B padded with zeros to a multiple of pad; transpose reads it transposed, [P/2, B, A'], so
+  the incoming edges' operands come out contracted along their last axis too.
   """
-  M, K = x.shape
+  K = x.shape[-1]
   ci = wp.shape[1] // 2
-  vec = lambda n: pl.BlockSpec((n,), lambda i: (0,))
-  wspec = pl.BlockSpec((K, ci), lambda i: (0, 0))
-  out = pl.BlockSpec((ci, block_m), lambda i: (0, i))
+  dtype = jnp.float8_e4m3fn if fp8 else x.dtype
   halves = [t for w, b in ((wp, bp), (wg, bg)) for t in (w[:, :ci], b[:ci])]
   halves += [t for w, b in ((wp, bp), (wg, bg)) for t in (w[:, ci:], b[ci:])]
-  return pl.pallas_call(
-      functools.partial(_ln_gdp_kernel, activation=jax.nn.sigmoid, eps=eps, m=M, block_m=block_m),
-      grid=(pl.cdiv(M, block_m),),
-      in_specs=[pl.BlockSpec((block_m, K), lambda i: (i, 0)), vec(K), vec(K)]
-               + [wspec, vec(ci)] * 4 + [pl.BlockSpec((block_m,), lambda i: (i,))],
+  m_out = None
+  if x.ndim == 3 and transpose:
+    # grid (a block, b): each block is block_m rows of column b of the pair, stored at (b, a); b innermost, so
+    # consecutive blocks read neighbouring rows of the pair
+    A, B = x.shape[0], x.shape[1]
+    m, m_out = A, -(-A // pad) * pad
+    grid, row_axis = (pl.cdiv(m_out, block_m), B), 0
+    vec = lambda n: pl.BlockSpec((n,), lambda a, b: (0,))
+    wspec = pl.BlockSpec((K, ci), lambda a, b: (0, 0))
+    xspec = pl.BlockSpec((block_m, None, K), lambda a, b: (a, b, 0))
+    mspec = pl.BlockSpec((block_m, None), lambda a, b: (a, b))
+    out = pl.BlockSpec((ci, None, block_m), lambda a, b: (0, b, a))
+    out_shape = [jax.ShapeDtypeStruct((ci, B, m_out), dtype)] * 2
+  elif x.ndim == 3:
+    # grid (a, b block): block_m rows along row a of the pair, stored at (a, b)
+    A, B = x.shape[0], x.shape[1]
+    m, m_out = B, -(-B // pad) * pad
+    grid, row_axis = (A, pl.cdiv(m_out, block_m)), 1
+    vec = lambda n: pl.BlockSpec((n,), lambda a, b: (0,))
+    wspec = pl.BlockSpec((K, ci), lambda a, b: (0, 0))
+    xspec = pl.BlockSpec((None, block_m, K), lambda a, b: (a, b, 0))
+    mspec = pl.BlockSpec((None, block_m), lambda a, b: (a, b))
+    out = pl.BlockSpec((ci, None, block_m), lambda a, b: (0, a, b))
+    out_shape = [jax.ShapeDtypeStruct((ci, A, m_out), dtype)] * 2
+  else:
+    M = x.shape[0]
+    grid, m, row_axis = (pl.cdiv(M, block_m),), M, 0
+    vec = lambda n: pl.BlockSpec((n,), lambda i: (0,))
+    wspec = pl.BlockSpec((K, ci), lambda i: (0, 0))
+    xspec = pl.BlockSpec((block_m, K), lambda i: (i, 0))
+    mspec = pl.BlockSpec((block_m,), lambda i: (i,))
+    out = pl.BlockSpec((ci, block_m), lambda i: (0, i))
+    out_shape = [jax.ShapeDtypeStruct((ci, M), dtype)] * 2
+  left, right = pl.pallas_call(
+      functools.partial(_ln_gdp_kernel, activation=jax.nn.sigmoid, eps=eps, m=m, block_m=block_m,
+                        row_axis=row_axis, m_out=m_out, fp8=fp8),
+      grid=grid,
+      in_specs=[xspec, vec(K), vec(K)] + [wspec, vec(ci)] * 4 + [mspec],
       out_specs=[out, out],
-      out_shape=[jax.ShapeDtypeStruct((ci, M), x.dtype)] * 2,
+      out_shape=out_shape,
       # swept on the L40S: 15% faster than 128 rows x 8 warps
       compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=1), name="ln_gated_dual_proj",
   )(x, ln_scale, ln_offset, *halves, mask)
+  return left, right
 
 
-def ref_ln_gdp(x, ln_scale, ln_offset, wp, bp, wg, bg, mask, *, eps=1e-5):
+def ref_ln_gdp(x, ln_scale, ln_offset, wp, bp, wg, bg, mask, *, eps=1e-5, transpose=False, pad=1, **_):
+  pair = x.shape[:2] if x.ndim == 3 else None
+  if pair is not None:
+    x, mask = (jnp.swapaxes(x, 0, 1), mask.T) if transpose else (x, mask)
+    pair = x.shape[:2]
+    x, mask = x.reshape(-1, x.shape[-1]), mask.reshape(-1)
   y = ref_gdp(ref_ln(x.astype(jnp.float32), ln_scale, ln_offset, eps), wp.astype(jnp.float32),
               bp.astype(jnp.float32), wg.astype(jnp.float32), bg.astype(jnp.float32), mask.astype(jnp.float32))
   ci = wp.shape[1] // 2
-  return y[:, :ci].T, y[:, ci:].T
+  left, right = y[:, :ci].T, y[:, ci:].T
+  if pair is None:
+    return left, right
+  rows = -(-pair[1] // pad) * pad
+  shape = lambda h: jnp.pad(h.reshape(ci, *pair), ((0, 0), (0, 0), (0, rows - pair[1])))
+  return shape(left), shape(right)
 
 
 def _epilogue_kernel(x_ref, a_ref, s_ref, o_ref_ln, wo_ref, bo_ref, wg_ref, bg_ref, *rest,

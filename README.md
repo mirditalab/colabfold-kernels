@@ -14,6 +14,7 @@ if kernel is not None:
 ```
 
 `attention`, `layer_norm` and `gated_dual_proj` each return `None` if not supported, as do the other
-`fused_ops` selectors.
+`fused_ops` selectors. The FP8 paths are opt-in (`global_config["fp8"]`) and need compute capability 8.9 or
+newer.
 `diffusion.install()` samples AF3-family diffusion in the
 [colabfold-cuda-kernels](https://github.com/mirditalab/colabfold-cuda-kernels) megakernel.
