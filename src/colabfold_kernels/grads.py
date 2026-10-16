@@ -133,7 +133,7 @@ def _via_bwd(fwd, ref, static, args, dy):
     full = list(args)
     for i, x in zip(diff, xs):
       full[i] = x
-    return ref(*full, **dict(static)).astype(dy.dtype)
+    return jax.tree.map(lambda o, d: o.astype(d.dtype), ref(*full, **dict(static)), dy)
   _, vjp = jax.vjp(f, *[args[i] for i in diff])
   grads = dict(zip(diff, vjp(dy)))
   return tuple(None if a is None else grads[i] if i in grads else _zero_like_cotangent(a)

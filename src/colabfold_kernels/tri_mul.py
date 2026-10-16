@@ -54,6 +54,19 @@ def _gdp_kernel_split_cm(x_ref, wpl_ref, bpl_ref, wgl_ref, bgl_ref,
                       m, activation).T.astype(or_ref.dtype)
 
 
+def _ln_gdp_kernel(x_ref, s_ref, offset_ref, wpl_ref, bpl_ref, wgl_ref, bgl_ref,
+                   wpr_ref, bpr_ref, wgr_ref, bgr_ref, mask_ref, ol_ref, or_ref, *, activation, eps, m, block_m):
+  # _gdp_kernel_split_cm on LN(x), so the normed pair never leaves the SM; rows past m are masked, not padded
+  rows = (pl.program_id(0) * block_m + jnp.arange(block_m)) < m
+  x = plgpu.load(x_ref, mask=rows[:, None], other=0.0).astype(jnp.float32)
+  x = ln_rows(x, s_ref, offset_ref, eps).astype(x_ref.dtype)
+  mask = plgpu.load(mask_ref, mask=rows, other=0)
+  left = _half(x, wpl_ref[...], bpl_ref[...], wgl_ref[...], bgl_ref[...], mask, activation)
+  plgpu.store(ol_ref, left.T.astype(ol_ref.dtype), mask=rows[None, :])
+  right = _half(x, wpr_ref[...], bpr_ref[...], wgr_ref[...], bgr_ref[...], mask, activation)
+  plgpu.store(or_ref, right.T.astype(or_ref.dtype), mask=rows[None, :])
+
+
 def _gdp_kernel_split(x_ref, wpl_ref, bpl_ref, wgl_ref, bgl_ref,
                       wpr_ref, bpr_ref, wgr_ref, bgr_ref, mask_ref,
                       ol_ref, or_ref, *, activation):
@@ -148,8 +161,43 @@ def gated_dual_proj(x, wp, bp, wg, bg, mask, *, block_m=None, split=False,
   return left[:M], right[:M]
 
 
+@functools.partial(jax.jit, static_argnames=("eps", "block_m"))
+def ln_gated_dual_proj(x, ln_scale, ln_offset, wp, bp, wg, bg, mask, *, eps=1e-5, block_m=64):
+  """gated_dual_proj(LN(x), ..., split=True, channel_major=True) in one pass over the raw input x [M, K].
+
+  Returns left, right [P/2, M]. K must be a power of two, the LayerNorm needs whole rows.
+  """
+  M, K = x.shape
+  ci = wp.shape[1] // 2
+  vec = lambda n: pl.BlockSpec((n,), lambda i: (0,))
+  wspec = pl.BlockSpec((K, ci), lambda i: (0, 0))
+  out = pl.BlockSpec((ci, block_m), lambda i: (0, i))
+  halves = [t for w, b in ((wp, bp), (wg, bg)) for t in (w[:, :ci], b[:ci])]
+  halves += [t for w, b in ((wp, bp), (wg, bg)) for t in (w[:, ci:], b[ci:])]
+  return pl.pallas_call(
+      functools.partial(_ln_gdp_kernel, activation=jax.nn.sigmoid, eps=eps, m=M, block_m=block_m),
+      grid=(pl.cdiv(M, block_m),),
+      in_specs=[pl.BlockSpec((block_m, K), lambda i: (i, 0)), vec(K), vec(K)]
+               + [wspec, vec(ci)] * 4 + [pl.BlockSpec((block_m,), lambda i: (i,))],
+      out_specs=[out, out],
+      out_shape=[jax.ShapeDtypeStruct((ci, M), x.dtype)] * 2,
+      # swept on the L40S: 15% faster than 128 rows x 8 warps
+      compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=1), name="ln_gated_dual_proj",
+  )(x, ln_scale, ln_offset, *halves, mask)
+
+
+def ref_ln_gdp(x, ln_scale, ln_offset, wp, bp, wg, bg, mask, *, eps=1e-5):
+  y = ref_gdp(ref_ln(x.astype(jnp.float32), ln_scale, ln_offset, eps), wp.astype(jnp.float32),
+              bp.astype(jnp.float32), wg.astype(jnp.float32), bg.astype(jnp.float32), mask.astype(jnp.float32))
+  ci = wp.shape[1] // 2
+  return y[:, :ci].T, y[:, ci:].T
+
+
 def _epilogue_kernel(x_ref, a_ref, s_ref, o_ref_ln, wo_ref, bo_ref, wg_ref, bg_ref, *rest,
-                     eps, m, block_m):
+                     eps, m, block_m, input_ln=False, add_input=False):
+  # input_ln: a_ref is the raw module input and rest leads with its LayerNorm's scale and offset
+  as_ref, ao_ref = rest[:2] if input_ln else (None, None)
+  rest = rest[2:] if input_ln else rest
   r_ref, o_ref = rest if len(rest) == 2 else (None, rest[0])
   # x_ref [C, block_m] channel-major triangle product; a_ref [block_m, Ca] normed input
   rows = (pl.program_id(0) * block_m + jnp.arange(block_m)) < m
@@ -157,10 +205,15 @@ def _epilogue_kernel(x_ref, a_ref, s_ref, o_ref_ln, wo_ref, bo_ref, wg_ref, bg_r
   y = ln_rows(x, s_ref, o_ref_ln, eps)
   out = _dot(y.astype(wo_ref.dtype), wo_ref[...]) + bo_ref[...][None, :].astype(jnp.float32)
   a = plgpu.load(a_ref, mask=rows[:, None], other=0.0)
+  if input_ln:
+    a_raw = a.astype(jnp.float32)
+    a = ln_rows(a_raw, as_ref, ao_ref, eps).astype(a_ref.dtype)
   gate = _dot(a, wg_ref[...]) + bg_ref[...][None, :].astype(jnp.float32)
   out = out * jax.nn.sigmoid(gate)
   if r_ref is not None:
     out = out + plgpu.load(r_ref, mask=rows[:, None], other=0.0).astype(jnp.float32)
+  if add_input:
+    out = out + a_raw
   plgpu.store(o_ref, out.astype(o_ref.dtype), mask=rows[:, None])
 
 
@@ -184,21 +237,51 @@ def trimul_epilogue(x_cm, act, ln_scale, ln_offset, wo, bo, wg, bg, residual=Non
   dtype = act.dtype if residual is None else residual.dtype
   if not epilogue_supported(c, ca, o):
     return ref_trimul_epilogue(x_cm, act, ln_scale, ln_offset, wo, bo, wg, bg, residual, eps=eps).astype(dtype)
+  extra = [] if residual is None else [residual]
+  return _epilogue(x_cm, act, [ln_scale, ln_offset, wo, bo, wg, bg], extra, dtype, eps=eps, block_m=block_m,
+                   num_warps=num_warps, num_stages=num_stages)
+
+
+def _epilogue(x_cm, act, params, extra, dtype, *, eps, block_m, num_warps, num_stages, input_ln=False,
+              add_input=False):
+  c, m = x_cm.shape
+  ca, o = act.shape[1], params[2].shape[1]
   vec = lambda n: pl.BlockSpec((n,), lambda i: (0,))
   rows = pl.BlockSpec((block_m, o), lambda i: (i, 0))
-  extra = [] if residual is None else [residual]
   return pl.pallas_call(
-      functools.partial(_epilogue_kernel, eps=eps, m=m, block_m=block_m),
+      functools.partial(_epilogue_kernel, eps=eps, m=m, block_m=block_m, input_ln=input_ln, add_input=add_input),
       grid=(pl.cdiv(m, block_m),),
       in_specs=[pl.BlockSpec((c, block_m), lambda i: (0, i)),
                 pl.BlockSpec((block_m, ca), lambda i: (i, 0)), vec(c), vec(c),
                 pl.BlockSpec((c, o), lambda i: (0, 0)), vec(o),
-                pl.BlockSpec((ca, o), lambda i: (0, 0)), vec(o)] + [rows] * len(extra),
+                pl.BlockSpec((ca, o), lambda i: (0, 0)), vec(o)]
+               + [vec(ca)] * (2 if input_ln else 0) + [rows] * len(extra),
       out_specs=rows,
       out_shape=jax.ShapeDtypeStruct((m, o), dtype),
       compiler_params=plgpu.CompilerParams(num_warps=num_warps, num_stages=num_stages),
       name="trimul_epilogue",
-  )(x_cm, act, ln_scale, ln_offset, wo, bo, wg, bg, *extra)
+  )(x_cm, act, *params, *extra)
+
+
+@functools.partial(jax.jit, static_argnames=("eps", "add_input", "block_m", "num_warps", "num_stages"))
+def trimul_epilogue_ln(x_cm, x, in_scale, in_offset, ln_scale, ln_offset, wo, bo, wg, bg, *, eps=1e-5,
+                       add_input=False, block_m=64, num_warps=4, num_stages=2):
+  """trimul_epilogue gated by LN(x), recomputed from the raw module input x [M, Ca] with in_scale/in_offset.
+
+  add_input adds x, the module's residual update, from the tile already loaded.
+  """
+  c, ca, o = x_cm.shape[0], x.shape[1], wo.shape[1]
+  if not epilogue_supported(c, ca, o):
+    return ref_trimul_epilogue_ln(x_cm, x, in_scale, in_offset, ln_scale, ln_offset, wo, bo, wg, bg, eps=eps,
+                                  add_input=add_input).astype(x.dtype)
+  return _epilogue(x_cm, x, [ln_scale, ln_offset, wo, bo, wg, bg, in_scale, in_offset], [], x.dtype, eps=eps,
+                   block_m=block_m, num_warps=num_warps, num_stages=num_stages, input_ln=True, add_input=add_input)
+
+
+def ref_trimul_epilogue_ln(x_cm, x, in_scale, in_offset, ln_scale, ln_offset, wo, bo, wg, bg, *, eps=1e-5,
+                           add_input=False):
+  act = ref_ln(x.astype(jnp.float32), in_scale, in_offset, eps)
+  return ref_trimul_epilogue(x_cm, act, ln_scale, ln_offset, wo, bo, wg, bg, x if add_input else None, eps=eps)
 
 
 def ref_trimul_epilogue(x_cm, act, ln_scale, ln_offset, wo, bo, wg, bg, residual=None, *, eps=1e-5):

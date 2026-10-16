@@ -129,6 +129,51 @@ def trimul_epilogue(global_config, dtype):
   return differentiable_via(tri_mul.trimul_epilogue, tri_mul.ref_trimul_epilogue, nondiff=('eps',))
 
 
+def trimul_epilogue_ln(global_config, dtype):
+  """-> f(x_cm, x, in_scale, in_offset, ln_scale, ln_offset, wo, bo, wg, bg, *, eps, add_input) or None."""
+  if not _pallas_half(global_config, dtype):
+    return None
+  from colabfold_kernels.grads import differentiable_via
+  from colabfold_kernels import tri_mul
+  return differentiable_via(tri_mul.trimul_epilogue_ln, tri_mul.ref_trimul_epilogue_ln, nondiff=('eps', 'add_input'))
+
+
+def ln_gated_dual_proj(global_config, dtype, num_channel, num_intermediate):
+  """-> f(x, ln_scale, ln_offset, wp, bp, wg, bg, mask, *, eps) -> (left, right) channel major, or None."""
+  if not _pallas_half(global_config, dtype):
+    return None
+  from colabfold_kernels.grads import differentiable_via
+  from colabfold_kernels import tri_mul
+  if not tri_mul.epilogue_supported(num_channel, num_intermediate, num_intermediate):
+    return None
+  return differentiable_via(tri_mul.ln_gated_dual_proj, tri_mul.ref_ln_gdp, nondiff=('eps',))
+
+
+def ln_projection(global_config, dtype, num_channel, num_output=None):
+  """-> f(x, ln_scale, ln_offset, w, wb, *, eps) -> (p, bias) or None: LayerNorm then the packed and bias projections.
+
+  num_output is the width of each packed slot, None when only the bias is projected.
+  """
+  if not _pallas_half(global_config, dtype):
+    return None
+  from colabfold_kernels.grads import differentiable_via
+  from colabfold_kernels import packed_attn as pa
+  if not pa.projection_supported(num_channel, *([] if num_output is None else [num_output])):
+    return None
+  return differentiable_via(pa.ln_projection, pa.ref_ln_projection, nondiff=('eps',))
+
+
+def output_projection(global_config, dtype, num_input, num_output):
+  """-> f(o, w, b, residual=None) or None: the attention output projection with its residual update."""
+  if not _pallas_half(global_config, dtype):
+    return None
+  from colabfold_kernels.grads import differentiable_via
+  from colabfold_kernels import packed_attn as pa
+  if not pa.projection_supported(num_input, num_output):
+    return None
+  return differentiable_via(pa.output_projection, pa.ref_output_projection)
+
+
 def layer_norm(global_config, dtype):
   """-> f(x, scale, offset, *, eps) or None. Last-axis, scale+offset only."""
   import jax.numpy as jnp
