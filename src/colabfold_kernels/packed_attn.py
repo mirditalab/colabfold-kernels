@@ -16,6 +16,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
 from colabfold_kernels.transition import ln_rows, ref_ln
+from colabfold_kernels.device import compute_capability
 from colabfold_kernels.tri_flash import NEG, _chunks, _kernel, _pow2_tile, e4m3, fp8_supported
 
 _dot = functools.partial(jnp.dot, preferred_element_type=jnp.float32)
@@ -23,7 +24,7 @@ _dot = functools.partial(jnp.dot, preferred_element_type=jnp.float32)
 
 @functools.partial(jax.jit, static_argnames=(
     "sm_scale", "column", "block_q", "block_k", "num_warps", "num_stages"))
-def packed_attention(p, bias, kmask, gate_bias=None, kv=None, *, sm_scale, column=False, block_q=128,
+def packed_attention(p, bias, kmask, gate_bias=None, kv=None, *, sm_scale, column=False, block_q=None,
                      block_k=None, num_warps=4, num_stages=None):
   """p [X, Y, G, H, D] (G = 3, or 4 with a gate); bias [H, Sq, Sk]; kmask [batch, Sk] bool;
   gate_bias [H, D] when G == 4. Rows: batch X, sequence Y; column: batch Y, sequence X.
@@ -36,10 +37,16 @@ def packed_attention(p, bias, kmask, gate_bias=None, kv=None, *, sm_scale, colum
   chunks = _chunks(D)
   dk = chunks[-1][0] + chunks[-1][1]
   # swept on sm_120 at the triangle and MSA shapes: 12-17% over block_q=64
-  block_k = block_k or _pow2_tile(min(32, D))
+  # ...and on an A100 (sm_80) at a 1,000-residue deep-MSA fold's: heads narrower than 32 (the extra MSA's 8) take
+  # 64 x 64 tiles, the key tile otherwise only 16 wide (5,120 rows: 83.5 -> 58.0 ms), and the row attention three
+  # stages like the column's (508 rows: 9.78 -> 7.11 ms, bit-identical)
+  ampere = compute_capability() == 80
+  narrow = ampere and D < 32
+  block_q = block_q or (64 if narrow else 128)
+  block_k = block_k or (64 if narrow else _pow2_tile(min(32, D)))
   fp8 = kv is not None
   assert not fp8 or fp8_supported(D, block_k), (D, block_k)
-  num_stages = num_stages or (3 if column else 2)
+  num_stages = num_stages or (3 if column or ampere else 2)
   # grid (q_block, head, batch): batch innermost keeps bias[h, q_block, :] hot in L2.
   grid = (pl.cdiv(s, block_q), H, nb)
   if column:
@@ -231,6 +238,9 @@ def output_projection(o, w, b, residual=None, *, block_m=64, num_warps=None, num
   m, k = o.shape
   c = w.shape[1]
   block_k = min(k, 64)
+  if compute_capability() == 80 and c > 128:
+    # an A100 at the MSA's 508,000 x 256, bit-identical: 1.13 -> 0.75 ms
+    block_m, num_warps, num_stages = 128, num_warps or 8, 3
   num_warps = num_warps or (8 if c > 128 else 4)
   rows = pl.BlockSpec((block_m, c), lambda i: (i, 0))
   extra = [] if residual is None else [residual]
