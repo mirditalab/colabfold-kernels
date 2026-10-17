@@ -15,7 +15,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
-from colabfold_kernels.device import compute_capability, is_rocm
+from colabfold_kernels.device import compute_capability, is_rocm, l2_cache_size
 from colabfold_kernels.transition import ln_rows, ref_ln
 from colabfold_kernels.tri_flash import LOG2E, NEG, _chunks, _kernel, _pow2_tile, e4m3, fp8_supported
 
@@ -31,7 +31,7 @@ def packed_attention(p, bias, kmask, gate_bias=None, kv=None, *, sm_scale, colum
   kv [X, Y, 2, H, D], the k and v slots in e4m3, leaves p with q and the gate: both dots then run e4m3.
   half: the softmax in f16, by default when p is f16 on CUDA (a bf16 p's conversion in the kernel costs what it saves).
   The output is out_dtype, else p's. group: batches a q block runs adjacent (see the grid), 0 for none; by default 16
-  from 20 MB of bias, where a batch's sweep outgrows half an A100's L2, else none."""
+  once the bias outgrows half the L2, else none."""
   X, Y, G, H, D = p.shape
   half = (p.dtype == jnp.float16 and kv is None and not is_rocm()) if half is None else half
   assert not (half and kv is not None)
@@ -53,9 +53,8 @@ def packed_attention(p, bias, kmask, gate_bias=None, kv=None, *, sm_scale, colum
   # (one bias tile read for G) and a group's K/V in L2 across its q blocks
   nq = pl.cdiv(s, block_q)
   if group is None:
-    # A100 (40 MB L2): 2,616 rows 1.25x, columns 1.33x; 2,088 (35 MB of bias) 1.05x / 1.24x; 1,568 (20 MB) level;
-    # 1,048 (9 MB) 10% slower grouped. jax does not report the L2, hence the one constant
-    group = 16 if not is_rocm() and H * s * s * 2 >= 20 << 20 else 0
+    # grouping pays once the bias outgrows half the L2, and costs while it fits; 20 MB where jax cannot tell the L2
+    group = 16 if not is_rocm() and H * s * s * 2 >= (l2_cache_size() or 40 << 20) // 2 else 0
   if group:
     grid = (group * nq, H, pl.cdiv(nb, group))
     # a last group's batches past nb repeat the last one: the same output written twice

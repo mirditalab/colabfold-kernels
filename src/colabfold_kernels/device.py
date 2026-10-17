@@ -19,6 +19,19 @@ def is_rocm():
   return "rocm" in (jax.default_backend() + jax.devices()[0].client.platform_version).lower()
 
 
+@functools.lru_cache(maxsize=None)
+def l2_cache_size():
+  """The GPU's L2 in bytes, from XLA's description of it (jaxlib 0.11.2+; jax has no device attribute), or None."""
+  try:
+    import re
+    import jax
+    from jax._src.lib import xla_client
+    m = re.search(rb"(\d+)B L2\$", xla_client.get_topology_for_devices(jax.devices()[:1]).serialize())
+    return int(m.group(1)) if m else None
+  except Exception:
+    return None
+
+
 def shared_memory_limit():
   """The smallest shared memory budget across the GPUs here, or None."""
   import jax
