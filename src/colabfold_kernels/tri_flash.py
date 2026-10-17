@@ -57,9 +57,11 @@ def _chunks(d):
 
 
 def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, *rest,
-            sm_scale, block_q, block_k, sq, d, chunks, gated=False, fp8=False):
+            sm_scale, block_q, block_k, sq, d, chunks, gated=False, fp8=False, prefix=False):
   # gated: a gate [block_q, W] and its bias [W] come first, the output is o * sigmoid(gate + bias)
   # fp8: k and v come in e4m3 (fp8_supported), q is cast here, both dots accumulate in fp32
+  # prefix: the row's count of leading key blocks with no masked key comes first; those skip the key mask
+  pre_ref, *rest = rest if prefix else (None, *rest)
   g_ref, gb_ref, *rest = rest if gated else (None, None, *rest)
   o_ref, lse_ref = rest[0], rest[1] if len(rest) > 1 else None
   # q_ref [block_q, W]; k_ref/v_ref [Sk, W]; bias_ref [block_q, Sk]; kmask_ref [Sk],
@@ -82,7 +84,7 @@ def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, *rest,
   l_i = jnp.zeros(block_q, jnp.float32)
   os = [jnp.zeros((block_q, w), jnp.float32) for _, w in chunks]
 
-  def body(j, carry, tail=False):
+  def body(j, carry, tail=False, masked=True):
     # tail: the one key block that runs past Sk; every other block is whole and needs no bounds masks
     o_prev, m_prev, l_prev = carry
     # the tail's start is traced: a static one past Sk - block_k fails the slice bounds check its mask makes safe
@@ -97,9 +99,10 @@ def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, *rest,
       qk = part if qk is None else qk + part
     bias = plgpu.load(bias_ref.at[:, sl], mask=_and(q_valid[:, None], None if kb is None else kb[None, :]), other=0.0)
     qk = (qk * sm_scale + bias) * LOG2E
-    km = _load(kmask_ref.at[sl], kb, False)
-    # masked keys share a finite floor; keys past Sk get none, so a fully masked row averages Sk keys
-    qk = jnp.where(km[None, :], qk, NEG if kb is None else jnp.where(kb, NEG, -jnp.inf)[None, :])
+    if masked:
+      km = _load(kmask_ref.at[sl], kb, False)
+      # masked keys share a finite floor; keys past Sk get none, so a fully masked row averages Sk keys
+      qk = jnp.where(km[None, :], qk, NEG if kb is None else jnp.where(kb, NEG, -jnp.inf)[None, :])
     m_curr = jnp.max(qk, axis=-1)
     m_next = jnp.maximum(m_prev, m_curr)
     corr = jnp.exp2(m_prev - m_next)
@@ -112,7 +115,13 @@ def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, *rest,
       o_next.append(corr[:, None] * oc + _dot(s.astype(vc.dtype), vc))
     return o_next, m_next, l_next
 
-  carry = jax.lax.fori_loop(0, sk // block_k, body, (os, m_i, l_i))
+  carry = (os, m_i, l_i)
+  if prefix:
+    full = jnp.minimum(pre_ref[0], sk // block_k)
+    carry = jax.lax.fori_loop(0, full, functools.partial(body, masked=False), carry)
+    carry = jax.lax.fori_loop(full, sk // block_k, body, carry)
+  else:
+    carry = jax.lax.fori_loop(0, sk // block_k, body, carry)
   if sk % block_k:
     carry = body(sk // block_k, carry, tail=True)
   os, m_i, l_i = carry
