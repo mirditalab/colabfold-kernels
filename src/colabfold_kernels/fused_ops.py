@@ -47,18 +47,34 @@ def _pallas_half(global_config, dtype):
 
 
 def fp8_attention(global_config, key_dim):
-  """The projection may write k and v in e4m3 for packed_attention: asked for (global_config.fp8), on a card with
-  8-bit MMAs (NVIDIA, compute capability 8.9 on), at a head dim of a power of two from their K of 32.
-
-  Not where the Mosaic GPU kernel runs: on sm_120 it is 27% faster in bf16 than Triton's in e4m3.
-  """
-  if not global_config.get('fp8', False) or key_dim & (key_dim - 1) or key_dim < 32:
-    return False
+  """The projection may write k and v in e4m3 for Triton's packed_attention (0.6.0's interface, AF2 calls it): not
+  where the Mosaic GPU kernel runs, which wants q and k (fp8_attention_slots)."""
   if global_config.get('mosaic_gpu', True) and _mgpu_attn() is not None:
     return False
+  return fp8_attention_slots(global_config, None, key_dim, 0) is not None
+
+
+def fp8_attention_slots(global_config, dtype, key_dim, seq_len):
+  """(f8_slots, f8_scales) for the projection to write in e4m3 for packed_attention, or None: asked for
+  (global_config.fp8), on a card with 8-bit MMAs (NVIDIA, compute capability 8.9 on), at a head dim of a power of two
+  from their K of 32. Triton's kernel takes k and v; the Mosaic GPU one q, pre-scaled, and k (its e4m3 p.v is no faster).
+  """
+  if not global_config.get('fp8', False) or key_dim & (key_dim - 1) or key_dim < 32:
+    return None
   from colabfold_kernels.device import compute_capability, is_rocm
+  from colabfold_kernels.tri_flash import LOG2E
   cc = compute_capability()
-  return cc is not None and cc >= 89 and not is_rocm()
+  if cc is None or cc < 89 or is_rocm():
+    return None
+  if dtype is not None and global_config.get('mosaic_gpu', True) and _mosaic_runs(key_dim, dtype, seq_len):
+    return (0, 1), (key_dim ** -0.5 * LOG2E, 1.0)
+  return (1, 2), (1.0, 1.0)
+
+
+def _mosaic_runs(head_dim, dtype, seq_len):
+  """The Mosaic GPU kernel runs here at this shape: _mosaic_or_triton and fp8_attention must agree on it."""
+  mgpu_attn = _mgpu_attn()
+  return mgpu_attn is not None and mgpu_attn.supported(head_dim, dtype, seq_len)
 
 
 @functools.lru_cache(maxsize=None)
@@ -82,15 +98,12 @@ def _mgpu_attn():
     return None
 
 
-def _mosaic_or_triton(p, bias, kmask, gate_bias=None, kv=None, *, sm_scale, column=False):
-  """The Mosaic GPU kernel where it runs, else Triton's, the only one that takes e4m3 k and v."""
+def _mosaic_or_triton(p, bias, kmask, gate_bias=None, p8=None, *, sm_scale, column=False):
+  """The Mosaic GPU kernel where it runs, else Triton's. p8 holds the e4m3 slots fp8_attention chose for that kernel."""
   from colabfold_kernels import packed_attn as pa
-  if kv is not None:
-    return pa.packed_attention(p, bias, kmask, gate_bias, kv, sm_scale=sm_scale, column=column)
-  mgpu_attn = _mgpu_attn()
-  if mgpu_attn is not None and mgpu_attn.supported(p.shape[-1], p.dtype, p.shape[0 if column else 1]):
-    return mgpu_attn.packed_attention(p, bias, kmask, gate_bias, sm_scale=sm_scale, column=column)
-  return pa.packed_attention(p, bias, kmask, gate_bias, sm_scale=sm_scale, column=column)
+  if _mosaic_runs(p.shape[-1], p.dtype, p.shape[0 if column else 1]):
+    return _mgpu_attn().packed_attention(p, bias, kmask, gate_bias, p8, sm_scale=sm_scale, column=column)
+  return pa.packed_attention(p, bias, kmask, gate_bias, p8, sm_scale=sm_scale, column=column)
 
 
 def packed_attention(global_config, dtype, key_dim, value_dim):
@@ -193,7 +206,7 @@ def ln_projection(global_config, dtype, num_channel, num_output=None):
   from colabfold_kernels import packed_attn as pa
   if not pa.ln_projection_supported(num_channel, num_output):
     return None
-  return differentiable_via(pa.ln_projection, pa.ref_ln_projection, nondiff=('eps', 'f8_slots'))
+  return differentiable_via(pa.ln_projection, pa.ref_ln_projection, nondiff=('eps', 'f8_slots', 'f8_scales'))
 
 
 def output_projection(global_config, dtype, num_input, num_output):

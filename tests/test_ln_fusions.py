@@ -138,9 +138,24 @@ if (compute_capability() or 0) >= 89 and not is_rocm():
       expect(f"fp8 attention n={n} d={d} column={column}", e < 0.08, f"rms {e:.2e}")
   # an 8-bit MMA's K is 32: narrower heads are never offered e4m3
   expect("fp8 attention refused at head dims 8 and 16",
-         not any(fused_ops.fp8_attention({"fp8": True}, d) for d in (8, 16)), "")
-  expect("fp8 attention off where the Mosaic kernel runs",
-         fused_ops.fp8_attention({"fp8": True}, 32) == (fused_ops._mgpu_attn() is None), "")
+         not any(fused_ops.fp8_attention_slots({"fp8": True}, dt, d, 64) or fused_ops.fp8_attention({"fp8": True}, d)
+                 for d in (8, 16)), "")
+  # where the Mosaic kernel runs it takes q (pre-scaled) and k in e4m3, and p keeps v and the gate
+  from colabfold_kernels import mgpu_attn
+  from colabfold_kernels.tri_flash import LOG2E
+  if fused_ops._mgpu_attn() is not None:
+    expect("fp8 attention takes q and k where the Mosaic kernel runs",
+           fused_ops.fp8_attention_slots({"fp8": True}, dt, 32, 264)[0] == (0, 1)
+           and not fused_ops.fp8_attention({"fp8": True}, 32), "")
+    for n, d in ((264, 32), (136, 64)):
+      p, bias, gb = f(n, n, 4, 4, d, s=1.), f(4, n, n), f(4, d)
+      kmask = jnp.asarray(rng.uniform(size=(n, n)) > .1)
+      qk8 = e4m3(p[:, :, :2].astype(jnp.float32) * jnp.asarray([d ** -0.5 * LOG2E, 1.])[:, None, None])
+      for column in (False, True):
+        kw = dict(sm_scale=d ** -0.5, column=column)
+        o8 = mgpu_attn.packed_attention(p[:, :, 2:], bias, kmask, gb, qk8, **kw)
+        e = rms(o8, pa.ref_packed_attention(p, bias, kmask, gb, **kw))
+        expect(f"fp8 Mosaic attention n={n} d={d} column={column}", e < 0.08, f"rms {e:.2e}")
   m = 4101
   x, sc, of = f(m, 128, s=2.), f32(128), f32(128)
   w4, wb = f(4, 128, 128, s=.1), f(128, 4, s=.1)
@@ -152,6 +167,9 @@ if (compute_capability() or 0) >= 89 and not is_rocm():
   expect("ln_projection f8_slots: bf16 slots and bias", e < 1e-2, f"max rel {e:.2e}")
   e = rms(np.asarray(p8, np.float32).reshape(m, 2, 128), p16[:, 1:3])
   expect("ln_projection f8_slots: e4m3 slots", e < 0.05, f"rms {e:.2e}")
+  _, _, p8s = pa.ln_projection(x, sc, of, w4, wb, f8_slots=(0, 1), f8_scales=(0.25, 1.0))
+  e = rms(np.asarray(p8s, np.float32).reshape(m, 2, 128), p16[:, 0:2] * np.array([0.25, 1.0])[None, :, None])
+  expect("ln_projection f8_scales scale each e4m3 slot", e < 0.05, f"rms {e:.2e}")
   # the triangle contraction's e4m3 operands, padded to 16 along the contracted axis, plain and transposed
   n, cz = 259, 128
   x, mask = f(n, n, cz, s=2.), jnp.asarray((rng.uniform(size=(n, n)) > .1).astype(np.float32), dt)

@@ -118,7 +118,7 @@ def ln_projection_supported(a, n=None):
   return a & (a - 1) == 0 and 16 <= a <= 256 and (n is None or projection_supported(n) or n in (256, 384, 512))
 
 
-def _ln_proj_kernel(x_ref, s_ref, offset_ref, *refs, eps, m, block_m, slots, heads, f8_slots):
+def _ln_proj_kernel(x_ref, s_ref, offset_ref, *refs, eps, m, block_m, slots, heads, f8_slots, f8_scales):
   # refs: w [slots, a, n] if slots, wb [heads, a] if heads, then the outputs in the same order, the e4m3 one last
   refs = list(refs)
   w_ref = refs.pop(0) if slots else None
@@ -137,7 +137,8 @@ def _ln_proj_kernel(x_ref, s_ref, offset_ref, *refs, eps, m, block_m, slots, hea
     for c0 in range(0, n, chunk):
       out = _dot(y, w_ref[g, :, pl.ds(c0, chunk)])
       if g in f8_slots:
-        plgpu.store(p8_ref.at[:, pl.ds(f8_slots.index(g) * n + c0, chunk)], e4m3(out), mask=rows[:, None])
+        i = f8_slots.index(g)
+        plgpu.store(p8_ref.at[:, pl.ds(i * n + c0, chunk)], e4m3(out * f8_scales[i]), mask=rows[:, None])
       else:
         plgpu.store(p_ref.at[:, pl.ds(half.index(g) * n + c0, chunk)], out.astype(p_ref.dtype), mask=rows[:, None])
   for h in range(heads):
@@ -146,15 +147,16 @@ def _ln_proj_kernel(x_ref, s_ref, offset_ref, *refs, eps, m, block_m, slots, hea
     plgpu.store(b_ref.at[h], b.astype(b_ref.dtype), mask=rows)
 
 
-@functools.partial(jax.jit, static_argnames=("eps", "block_m", "num_warps", "num_stages", "f8_slots"))
+@functools.partial(jax.jit, static_argnames=("eps", "block_m", "num_warps", "num_stages", "f8_slots", "f8_scales"))
 def ln_projection(x, ln_scale, ln_offset, w=None, wb=None, *, eps=1e-5, block_m=32, num_warps=8, num_stages=2,
-                  f8_slots=()):
+                  f8_slots=(), f8_scales=None):
   """LN(x) projected by each slot of w and by wb, from one read of x [M, a].
 
   w [G, a, n] gives p [M, G*n], the packed projection; wb [a, h] gives the bias channel-major [h, M].
   Returns (p, bias), None for an absent weight. f8_slots, slots of w written e4m3 to a third output
-  [M, len(f8_slots)*n] in that order, leave p with the others.
+  [M, len(f8_slots)*n] in that order, leave p with the others; f8_scales, one a slot, scale them before rounding.
   """
+  f8_scales = f8_scales or (1.0,) * len(f8_slots)
   m, a = x.shape
   slots = 0 if w is None else w.shape[0]
   heads = 0 if wb is None else wb.shape[1]
@@ -177,7 +179,7 @@ def ln_projection(x, ln_scale, ln_offset, w=None, wb=None, *, eps=1e-5, block_m=
   # swept on the L40S at the triangle attention's 4 x 128 outputs: 30% over 64 rows x 4 warps
   out = pl.pallas_call(
       functools.partial(_ln_proj_kernel, eps=eps, m=m, block_m=block_m, slots=slots, heads=heads,
-                        f8_slots=f8_slots),
+                        f8_slots=f8_slots, f8_scales=f8_scales),
       grid=(pl.cdiv(m, block_m),),
       in_specs=in_specs,
       out_specs=out_specs,
@@ -190,7 +192,7 @@ def ln_projection(x, ln_scale, ln_offset, w=None, wb=None, *, eps=1e-5, block_m=
   return (p, b, out.pop(0)) if f8_slots else (p, b)
 
 
-def ref_ln_projection(x, ln_scale, ln_offset, w=None, wb=None, *, eps=1e-5, f8_slots=()):
+def ref_ln_projection(x, ln_scale, ln_offset, w=None, wb=None, *, eps=1e-5, f8_slots=(), f8_scales=None):
   y = ref_ln(x.astype(jnp.float32), ln_scale, ln_offset, eps)
   b = None if wb is None else (y @ wb.astype(jnp.float32)).T
   if w is None:
@@ -198,7 +200,8 @@ def ref_ln_projection(x, ln_scale, ln_offset, w=None, wb=None, *, eps=1e-5, f8_s
   p = jnp.einsum('ma,gan->mgn', y, w.astype(jnp.float32))
   half = [g for g in range(w.shape[0]) if g not in f8_slots]
   flat = lambda gs: p[:, list(gs)].reshape(x.shape[0], -1)
-  return (flat(half), b, flat(f8_slots)) if f8_slots else (flat(half), b)
+  scale = jnp.repeat(jnp.asarray(f8_scales or (1.0,) * len(f8_slots), jnp.float32), w.shape[2])
+  return (flat(half), b, flat(f8_slots) * scale) if f8_slots else (flat(half), b)
 
 
 def _out_proj_kernel(o_ref, w_ref, b_ref, *rest, m, block_m, block_k):

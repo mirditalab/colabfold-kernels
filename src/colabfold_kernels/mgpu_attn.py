@@ -18,6 +18,10 @@ def supported(head_dim, dtype, seq_len):
   return head_dim in (16, 32, 64) and jnp.dtype(dtype) in (jnp.bfloat16, jnp.float16) and seq_len % 8 == 0
 
 
+# with qk8, q.k^T runs e4m3 (q pre-scaled by sm_scale * log2(e)): 7-10% faster on sm_120; e4m3 p.v measured no faster
+F8 = jnp.float8_e4m3fn
+
+
 def _acc_to_lhs(x, dtype):
   """The FA2 register trick: an accumulator's two adjacent n8 tiles are one k16 LHS tile."""
   import jax.experimental.mosaic.gpu as mgpu
@@ -39,14 +43,19 @@ def _tiles(cols, itemsize):
 
 
 @functools.partial(jax.jit, static_argnames=("sm_scale", "column", "C", "block_q", "block_k", "stages", "group"))
-def packed_attention(p, bias, kmask, gate_bias=None, *, sm_scale, column=False, C=None, block_q=128,
+def packed_attention(p, bias, kmask, gate_bias=None, qk8=None, *, sm_scale, column=False, C=None, block_q=128,
                      block_k=32, stages=None, group=None):
   """p [X, Y, G, H, D], bias [H, S, S], kmask [batch, S], gate_bias [H, D] iff G == 4; rows attend along Y.
 
+  qk8 [X, Y, 2, H, D] holds q, already scaled by sm_scale * log2(e), and k in e4m3; p keeps v and the gate.
   group batch groups run each query block back to back, so they read its bias tile from L2 once.
   """
   X, Y, G, H, D = p.shape
+  fp8 = qk8 is not None
+  G += 2 if fp8 else 0
   gated, dt = G == 4, p.dtype
+  # p's slots for v and the gate
+  vs, gs = (0, 1) if fp8 else (2, 3)
   assert G in (3, 4) and (gate_bias is not None) == gated
   nb, s = (Y, X) if column else (X, Y)
   # per-warpgroup MMA rows; a key-mask copy of C x block_k floats is a multiple of 128 bytes
@@ -67,14 +76,18 @@ def packed_attention(p, bias, kmask, gate_bias=None, *, sm_scale, column=False, 
   # a TMA copy moves a multiple of 128 bytes
   gb = jnp.pad((gate_bias if gated else jnp.zeros((H, D))).astype(jnp.float32), [(0, 0), (0, max(0, 32 - D))])
   ACC, LHS, RHS = L.MMA_ACC(dt), L.MMA_LHS(dt), L.MMA_RHS(dt)
+  qkt = F8 if fp8 else dt
+  QK_LHS, QK_RHS = L.MMA_LHS(qkt), L.MMA_RHS(qkt)
   # 65536 registers: the memory warpgroup keeps 24 per thread, compute warpgroups split the rest
   regs = min(240, (65536 // 128 - 24) // C // 8 * 8)
 
   def rows_of(ref, b, *idx):  # the [s, ...] sequence of batch b
     return ref.at[(slice(None), b, *idx) if column else (b, slice(None), *idx)]
 
-  def kernel(p_ref, bias_ref, kadd_ref, gb_ref, o_ref, buf, b_smem, k_smem, v_smem, ka_smem, gb_smem,
-             q_bar, g_bar, produced, consumed):
+  def kernel(p_ref, bias_ref, kadd_ref, gb_ref, qk_ref, o_ref, buf, *scratch):
+    # an e4m3 q has a buffer of its own; a bf16 one shares the gate's and output's
+    q_smem, scratch = (scratch[0], scratch[1:]) if fp8 else (buf, scratch)
+    b_smem, k_smem, v_smem, ka_smem, gb_smem, q_bar, g_bar, produced, consumed = scratch
     # grid (batch supergroup x head, query block x batch group): a query block's batch groups run adjacent and share
     # its bias tile in L2, a supergroup's K/V stay there across its query blocks
     sh, qg, wg = lax.axis_index("sh"), lax.axis_index("qg"), lax.axis_index("wg")
@@ -88,20 +101,22 @@ def packed_attention(p, bias, kmask, gate_bias=None, *, sm_scale, column=False, 
     def _compute():
       plgpu.set_max_registers(regs, action="increase")
       b = jnp.minimum(b0 + wg, nb - 1)
-      plgpu.copy_gmem_to_smem(rows_of(p_ref, b, 0, h).at[qrows], buf.at[wg], q_bar.at[wg])
+      plgpu.copy_gmem_to_smem(rows_of(qk_ref, b, 0, h).at[qrows], q_smem.at[wg], q_bar.at[wg])
       if gated:
         plgpu.copy_gmem_to_smem(gb_ref.at[h], gb_smem.at[wg], q_bar.at[wg])
       plgpu.barrier_wait(q_bar.at[wg])
-      q = (plgpu.load(buf.at[wg], layout=LHS).astype(jnp.float32) * (sm_scale * LOG2E)).astype(dt)
+      q = plgpu.load(q_smem.at[wg], layout=QK_LHS)
+      if not fp8:
+        q = (q.astype(jnp.float32) * (sm_scale * LOG2E)).astype(dt)
       # the gate reuses q's buffer: the copy's warpgroup sync orders it after every warp's q load
       if gated:
-        plgpu.copy_gmem_to_smem(rows_of(p_ref, b, 3, h).at[qrows], buf.at[wg], g_bar.at[wg])
+        plgpu.copy_gmem_to_smem(rows_of(p_ref, b, gs, h).at[qrows], buf.at[wg], g_bar.at[wg])
 
       def step(j, carry):
         o, m, l = carry
         slot = lax.rem(j, stages)
         plgpu.barrier_wait(produced.at[slot])
-        kt = plgpu.load(plgpu.transpose_ref(k_smem.at[slot, wg], (1, 0)), layout=RHS)
+        kt = plgpu.load(plgpu.transpose_ref(k_smem.at[slot, wg], (1, 0)), layout=QK_RHS)
         ka = plgpu.load(ka_smem.at[slot, wg], layout=ACC.reduce(0))
         # scores in log2 units, accumulated onto bias + key mask
         acc = plgpu.load(b_smem.at[slot], layout=ACC).astype(jnp.float32) * LOG2E + lax.broadcast_in_dim(ka, (bq, bk), [1])
@@ -144,8 +159,8 @@ def packed_attention(p, bias, kmask, gate_bias=None, *, sm_scale, column=False, 
         plgpu.copy_gmem_to_smem(kadd_ref.at[pl.ds(b0, C), keys], ka_smem.at[slot], produced.at[slot])
         for w in range(C):
           b = jnp.minimum(b0 + w, nb - 1)
-          plgpu.copy_gmem_to_smem(rows_of(p_ref, b, 1, h).at[keys], k_smem.at[slot, w], produced.at[slot])
-          plgpu.copy_gmem_to_smem(rows_of(p_ref, b, 2, h).at[keys], v_smem.at[slot, w], produced.at[slot])
+          plgpu.copy_gmem_to_smem(rows_of(qk_ref, b, 1, h).at[keys], k_smem.at[slot, w], produced.at[slot])
+          plgpu.copy_gmem_to_smem(rows_of(p_ref, b, vs, h).at[keys], v_smem.at[slot, w], produced.at[slot])
 
       # one warp issues the copies: a warpgroup-wide copy syncs all 128 threads per copy
       @plgpu.warp_map
@@ -164,8 +179,9 @@ def packed_attention(p, bias, kmask, gate_bias=None, *, sm_scale, column=False, 
     pl.run_scoped(
         lambda *scratch: kernel(*refs, *scratch),
         plgpu.SMEM((C, bq, D), dt, transforms=_tiles(D, dt.itemsize)),
+        *([plgpu.SMEM((C, bq, D), F8, transforms=_tiles(D, 1))] if fp8 else []),
         plgpu.SMEM((stages, bq, bk), dt, transforms=_tiles(bk, dt.itemsize)),
-        plgpu.SMEM((stages, C, bk, D), dt, transforms=_tiles(D, dt.itemsize)),
+        plgpu.SMEM((stages, C, bk, D), qkt, transforms=_tiles(D, jnp.dtype(qkt).itemsize)),
         plgpu.SMEM((stages, C, bk, D), dt, transforms=_tiles(D, dt.itemsize)),
         plgpu.SMEM((stages, C, bk), jnp.float32),
         plgpu.SMEM((C, gb.shape[1]), jnp.float32),
@@ -180,4 +196,4 @@ def packed_attention(p, bias, kmask, gate_bias=None, *, sm_scale, column=False, 
       entry, out_type=jax.ShapeDtypeStruct((X, Y, H, D), dt), grid=(nsg * H, nq * group), grid_names=("sh", "qg"),
       num_threads=C + 1, thread_name="wg",
       compiler_params=plgpu.CompilerParams(lowering_semantics=plgpu.LoweringSemantics.Lane, approx_math=True),
-  )(p, bias, kadd, gb)
+  )(p, bias, kadd, gb, p if qk8 is None else qk8)
