@@ -12,7 +12,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
-from colabfold_kernels.device import is_rocm
+from colabfold_kernels.device import compute_capability, is_rocm
 
 _dot = functools.partial(jnp.dot, preferred_element_type=jnp.float32)
 
@@ -71,6 +71,11 @@ def fused_transition(x, ln_scale, ln_offset, w1, b1, w2, b2, *, eps=1e-5, add_in
   hdim = w1.shape[1]
   # swept on sm_120 and gfx1151: the fp32 [block_m, C] accumulator lives in registers
   wide, rocm = c > 128, is_rocm()
+  if compute_capability() == 80:
+    # ...and on an A100 at a 1,000-residue deep-MSA fold's shapes, bit-identical: the MSA's 256 channels 7.05 ->
+    # 5.14 ms (508,000 rows), the pair's 128 2.36 -> 2.14 (1,000,000 rows)
+    block_m, chunk, num_warps, num_stages = (block_m or (64 if wide else 128)), (chunk or (32 if wide else 128)), \
+        (num_warps or (4 if wide else 8)), (num_stages or (2 if wide else 1))
   block_m = block_m or (64 if wide or rocm else 128)
   chunk = chunk or (64 if wide else 32)
   num_warps = num_warps or (8 if wide else 4)

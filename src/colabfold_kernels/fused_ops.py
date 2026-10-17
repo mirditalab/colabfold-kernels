@@ -193,6 +193,11 @@ def ln_projection(global_config, dtype, num_channel, num_output=None):
   from colabfold_kernels import packed_attn as pa
   if not pa.ln_projection_supported(num_channel, num_output):
     return None
+  # on an A100 (sm_80) the q/k/v/gate projection is faster as XLA's LayerNorm and a cuBLAS GEMM (the triangle's
+  # 1,000,000 x 128: 3.56 ms fused, 1.71 XLA; the MSA's 508,000 x 256: 4.46 and 2.03), the bias alone is not (0.63, 0.74)
+  from colabfold_kernels.device import compute_capability
+  if num_output is not None and compute_capability() == 80:
+    return None
   return differentiable_via(pa.ln_projection, pa.ref_ln_projection, nondiff=('eps', 'f8_slots'))
 
 
