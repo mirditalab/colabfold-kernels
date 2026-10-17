@@ -26,6 +26,26 @@ def ln_rows(x, scale_ref, offset_ref, eps):
   return y * scale_ref[...][None, :].astype(jnp.float32) + offset_ref[...][None, :].astype(jnp.float32)
 
 
+def sigmoid(x):
+  """In a kernel: sigmoid as 0.5 + 0.5 tanh(x / 2), one MUFU.TANH on CUDA instead of an exp and an IEEE divide."""
+  if is_rocm():
+    return jax.nn.sigmoid(x)
+  return 0.5 + 0.5 * plgpu.approx_tanh(0.5 * x)
+
+
+def swish(x):
+  """In a kernel: x sigmoid(x) as h + h tanh(h), h = x / 2."""
+  if is_rocm():
+    return jax.nn.swish(x)
+  h = 0.5 * x
+  return h + h * plgpu.approx_tanh(h)
+
+
+def fast(activation):
+  """The tanh form of a sigmoid or swish activation; any other passes through."""
+  return {jax.nn.sigmoid: sigmoid, jax.nn.swish: swish}.get(activation, activation)
+
+
 def ref_ln(xf, scale, offset, eps):
   """The float32 reference LayerNorm over the last axis."""
   mean = xf.mean(-1, keepdims=True)
@@ -111,7 +131,7 @@ def _glu_kernel(x_ref, s_ref, o_ref_ln, wa_ref, wb_ref, wo_ref, *refs, eps, m, b
 
   def body(k, acc):
     ks = pl.ds(pl.multiple_of(k * chunk, chunk), chunk)
-    h = activation(_dot(y, wa_ref[:, ks])) * _dot(y, wb_ref[:, ks])
+    h = fast(activation)(_dot(y, wa_ref[:, ks])) * _dot(y, wb_ref[:, ks])
     return acc + _dot(h.astype(wo_ref.dtype), wo_ref[ks, :])
 
   acc = jnp.zeros((block_m, wo_ref.shape[1]), jnp.float32)

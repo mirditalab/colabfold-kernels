@@ -15,7 +15,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
 from colabfold_kernels.device import is_rocm
-from colabfold_kernels.transition import ln_rows, ref_ln
+from colabfold_kernels.transition import fast, ln_rows, ref_ln, sigmoid
 from colabfold_kernels.tri_flash import e4m3
 
 # jnp.dot is stable across jax versions, contrary to pl.dot/plgpu.dot
@@ -33,14 +33,14 @@ def _gdp_kernel_tiled(x_ref, wp_ref, bp_ref, wg_ref, bg_ref, mask_ref, o_ref, *,
   proj, gate = jax.lax.fori_loop(0, x_ref.shape[1] // block_k, body, (zero, zero))
   proj += bp_ref[...][None, :].astype(jnp.float32)
   gate += bg_ref[...][None, :].astype(jnp.float32)
-  o = mask_ref[...][:, None].astype(jnp.float32) * proj * activation(gate)
+  o = mask_ref[...][:, None].astype(jnp.float32) * proj * fast(activation)(gate)
   o_ref[...] = o.astype(o_ref.dtype)
 
 
 def _half(x, wp, bp, wg, bg, mask, activation):
   proj = _dot(x, wp) + bp[None, :].astype(jnp.float32)
   gate = _dot(x, wg) + bg[None, :].astype(jnp.float32)
-  return mask[:, None].astype(jnp.float32) * proj * activation(gate)
+  return mask[:, None].astype(jnp.float32) * proj * fast(activation)(gate)
 
 
 def _gdp_kernel_split_cm(x_ref, wpl_ref, bpl_ref, wgl_ref, bgl_ref,
@@ -260,7 +260,7 @@ def _epilogue_kernel(x_ref, a_ref, s_ref, o_ref_ln, wo_ref, bo_ref, wg_ref, bg_r
     a_raw = a.astype(jnp.float32)
     a = ln_rows(a_raw, as_ref, ao_ref, eps).astype(a_ref.dtype)
   gate = _dot(a, wg_ref[...]) + bg_ref[...][None, :].astype(jnp.float32)
-  out = out * jax.nn.sigmoid(gate)
+  out = out * sigmoid(gate)
   if r_ref is not None:
     out = out + plgpu.load(r_ref, mask=rows[:, None], other=0.0).astype(jnp.float32)
   if add_input:
