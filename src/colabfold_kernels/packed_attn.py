@@ -15,7 +15,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
-from colabfold_kernels.device import is_rocm
+from colabfold_kernels.device import compute_capability, is_rocm
 from colabfold_kernels.transition import ln_rows, ref_ln
 from colabfold_kernels.tri_flash import LOG2E, NEG, _chunks, _kernel, _pow2_tile, e4m3, fp8_supported
 
@@ -177,7 +177,7 @@ def _ln_proj_kernel(x_ref, s_ref, offset_ref, *refs, eps, m, block_m, slots, hea
 
 @functools.partial(jax.jit, static_argnames=("eps", "block_m", "num_warps", "num_stages", "f8_slots", "f8_scales",
                                              "p_dtype"))
-def ln_projection(x, ln_scale, ln_offset, w=None, wb=None, *, eps=1e-5, block_m=32, num_warps=8, num_stages=2,
+def ln_projection(x, ln_scale, ln_offset, w=None, wb=None, *, eps=1e-5, block_m=None, num_warps=None, num_stages=2,
                   f8_slots=(), f8_scales=None, p_dtype=None):
   """LN(x) projected by each slot of w and by wb, from one read of x [M, a].
 
@@ -188,6 +188,11 @@ def ln_projection(x, ln_scale, ln_offset, w=None, wb=None, *, eps=1e-5, block_m=
   """
   f8_scales = f8_scales or (1.0,) * len(f8_slots)
   m, a = x.shape
+  # swept on the L40S at the triangle attention's 4 x 128 outputs: 30% over 64 rows x 4 warps; on the A100 64 x 4 is
+  # 1.6-1.8x over that up to 128 channels, 32 x 4 1.15x at 256 (where 64 x 4 is 2.4x slower)
+  if block_m is None or num_warps is None:
+    m_, w_ = ((64, 4) if a <= 128 else (32, 4)) if compute_capability() == 80 else (32, 8)
+    block_m, num_warps = block_m or m_, num_warps or w_
   slots = 0 if w is None else w.shape[0]
   heads = 0 if wb is None else wb.shape[1]
   vec = pl.BlockSpec((a,), lambda i: (0,))
@@ -206,7 +211,6 @@ def ln_projection(x, ln_scale, ln_offset, w=None, wb=None, *, eps=1e-5, block_m=
   if f8_slots:
     out_specs.append(pl.BlockSpec((block_m, len(f8_slots) * n), lambda i: (i, 0)))
     out_shape.append(jax.ShapeDtypeStruct((m, len(f8_slots) * n), jnp.float8_e4m3fn))
-  # swept on the L40S at the triangle attention's 4 x 128 outputs: 30% over 64 rows x 4 warps
   out = pl.pallas_call(
       functools.partial(_ln_proj_kernel, eps=eps, m=m, block_m=block_m, slots=slots, heads=heads,
                         f8_slots=f8_slots, f8_scales=f8_scales),
