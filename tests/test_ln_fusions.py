@@ -202,5 +202,21 @@ if (compute_capability() or 0) >= 89 and not is_rocm():
 else:
   print("no 8-bit MMAs here: e4m3 paths not tested")
 
+# the half softmax (CUDA): f16 scores, from a projection writing its packed slots in f16
+if compute_capability() is not None and not is_rocm():
+  for n, h, d, valid in ((264, 8, 8, 261), (130, 4, 32, 130), (100, 8, 8, 37), (264, 8, 32, 200)):
+    p, bias, gb = f(n, n, 4, h, d, s=1.), f(h, n, n, s=1.), f(h, d)
+    kmask = jnp.asarray(rng.uniform(size=(n, n)) > .1) & (jnp.arange(n) < valid)[None, :]
+    for column in (False, True):
+      kw = dict(sm_scale=d ** -0.5, column=column)
+      o = pa.packed_attention(p.astype(jnp.float16), bias, kmask, gb, out_dtype=dt, **kw)
+      e = rms(o, pa.ref_packed_attention(p, bias, kmask, gb, **kw))
+      expect(f"half attention n={n} h={h} d={d} column={column}", o.dtype == dt and e < 5e-3, f"rms {e:.2e}")
+  x, sc, of = f(259, 128, s=2.), f32(128), f32(128)
+  w4, wb = f(4, 128, 128, s=.1), f(128, 4, s=.1)
+  (ph, bh), (pr, br) = pa.ln_projection(x, sc, of, w4, wb, p_dtype=jnp.float16), pa.ref_ln_projection(x, sc, of, w4, wb)
+  expect("ln_projection p_dtype f16", ph.dtype == jnp.float16 and bh.dtype == dt and rel(ph, pr) < 1e-2,
+         f"max rel {rel(ph, pr):.2e}")
+
 print("FAILED" if bad else "all ok")
 sys.exit(bool(bad))

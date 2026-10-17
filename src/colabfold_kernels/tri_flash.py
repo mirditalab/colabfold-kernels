@@ -16,6 +16,8 @@ from colabfold_kernels.device import is_rocm
 _dot = functools.partial(jnp.dot, preferred_element_type=jnp.float32)
 
 NEG = -0.7 * float(np.finfo(np.float32).max)
+# half's floor: below any f16 logit by more than f16's exp2 range, and the difference of two of them still finite
+NEG16 = -30000.0
 LOG2E = math.log2(math.e)
 E4M3_MAX = 448.0
 # softmax probabilities are at most 1: 2^8 times that, through the exponent, keeps the small ones in e4m3's range
@@ -33,6 +35,14 @@ def exp2(x):
     return jnp.exp2(x)
   [r] = plgpu.elementwise_inline_asm("ex2.approx.ftz.f32 $0, $1;", args=[x], constraints="=f,f", pack=1,
                                      result_shape_dtypes=[jax.ShapeDtypeStruct(x.shape, x.dtype)])
+  return r
+
+
+def sub_exp2_h(x, m):
+  """In a kernel, CUDA only: 2^(x - m) for f16 x and m, two at a time (sub.f16x2, ex2.approx.f16x2)."""
+  [r] = plgpu.elementwise_inline_asm("{ .reg .b32 t; sub.f16x2 t, $1, $2; ex2.approx.f16x2 $0, t; }", args=[x, m],
+                                     constraints="=r,r,r", pack=2,
+                                     result_shape_dtypes=[jax.ShapeDtypeStruct(x.shape, jnp.float16)])
   return r
 
 
@@ -68,10 +78,12 @@ def _chunks(d):
 
 
 def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, *rest,
-            sm_scale, block_q, block_k, sq, d, chunks, gated=False, fp8=False, prefix=False):
+            sm_scale, block_q, block_k, sq, d, chunks, gated=False, fp8=False, prefix=False, half=False):
   # gated: a gate [block_q, W] and its bias [W] come first, the output is o * sigmoid(gate + bias)
   # fp8: k and v come in e4m3 (fp8_supported), q is cast here, both dots accumulate in fp32
   # prefix: the row's count of leading key blocks with no masked key comes first; those skip the key mask
+  # half (CUDA): the scores in f16, the bias (log2 domain, f16) the q.k^T accumulator, packed f16 max, subtract and
+  # exp2; the row sum p.1 on the tensor cores
   pre_ref, *rest = rest if prefix else (None, *rest)
   g_ref, gb_ref, *rest = rest if gated else (None, None, *rest)
   o_ref, lse_ref = rest[0], rest[1] if len(rest) > 1 else None
@@ -91,8 +103,13 @@ def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, *rest,
         for (off, w), c in zip(chunks, cols)]
   if fp8:
     qs = [e4m3(qc) for qc in qs]
-  m_i = jnp.full(block_q, -float('inf'), jnp.float32)
-  l_i = jnp.zeros(block_q, jnp.float32)
+  if half:
+    qs = [(qc.astype(jnp.float32) * (sm_scale * LOG2E)).astype(jnp.float16) for qc in qs]
+  m_i = jnp.full(block_q, -float('inf'), jnp.float16 if half else jnp.float32)
+  # half: the row sum as p.1 on the tensor cores - in v's padding column d when the head is narrower than its tile,
+  # else as a dot of its own, every one of whose 16 columns is the sum
+  ones_col = half and chunks[-1][0] + chunks[-1][1] > d
+  l_i = jnp.zeros(() if ones_col else (block_q, 16) if half else block_q, jnp.float32)
   os = [jnp.zeros((block_q, w), jnp.float32) for _, w in chunks]
 
   def body(j, carry, tail=False, masked=True):
@@ -102,6 +119,8 @@ def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, *rest,
     start = jnp.int32(j * block_k) if tail else pl.multiple_of(j * block_k, block_k)
     kb = (start + jnp.arange(block_k)) < sk if tail else None        # [block_k] in-bounds keys
     sl = pl.dslice(start, block_k)
+    if half:
+      return half_body(sl, kb, masked, o_prev, m_prev, l_prev)
     qk = None
     for qc, (off, w), c in zip(qs, chunks, cols):
       m = _and(None if kb is None else kb[:, None], None if c is None else c[None, :])
@@ -127,6 +146,34 @@ def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, *rest,
       o_next.append(corr[:, None] * oc + _dot(s.astype(vc.dtype), vc))
     return o_next, m_next, l_next
 
+  def half_body(sl, kb, masked, o_prev, m_prev, l_prev):
+    qk = None
+    for qc, (off, w), c in zip(qs, chunks, cols):
+      m = _and(None if kb is None else kb[:, None], None if c is None else c[None, :])
+      kc = _load(k_ref.at[sl, pl.dslice(off, w)], m, 0.0).astype(jnp.float16)
+      part = jnp.dot(qc, kc.T, preferred_element_type=jnp.float16)
+      qk = part if qk is None else qk + part
+    # the bias comes negated and is subtracted: added, Triton folds it into the dot's accumulator, whose load the
+    # pipeliner then leaves synchronous
+    qk = qk - plgpu.load(bias_ref.at[:, sl], mask=_and(q_valid[:, None], None if kb is None else kb[None, :]), other=0.0)
+    if masked:
+      km = _load(kmask_ref.at[sl], kb, False)
+      qk = jnp.where(km[None, :], qk, NEG16 if kb is None else jnp.where(kb, NEG16, -jnp.inf)[None, :].astype(qk.dtype))
+    elif kb is not None:
+      qk = jnp.where(kb[None, :], qk, -jnp.inf)
+    m_next = jnp.maximum(m_prev, jnp.max(qk, axis=-1))
+    corr = exp2(m_prev.astype(jnp.float32) - m_next.astype(jnp.float32))
+    s = sub_exp2_h(qk, jnp.broadcast_to(m_next[:, None], qk.shape))
+    l_next = l_prev if ones_col else corr[:, None] * l_prev + _dot(s, jnp.ones((block_k, 16), jnp.float16))
+    o_next = []
+    for oc, (off, w), c in zip(o_prev, chunks, cols):
+      m = _and(None if kb is None else kb[:, None], None if c is None else c[None, :])
+      vc = _load(v_ref.at[sl, pl.dslice(off, w)], m, 0.0).astype(jnp.float16)
+      if c is not None and ones_col:
+        vc = jnp.where((off + jnp.arange(w) == d)[None, :], jnp.float16(1), vc)
+      o_next.append(corr[:, None] * oc + _dot(s, vc))
+    return o_next, m_next, l_next
+
   carry = (os, m_i, l_i)
   if prefix:
     full = jnp.minimum(pre_ref[0], sk // block_k)
@@ -137,6 +184,11 @@ def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, *rest,
   if sk % block_k:
     carry = body(sk // block_k, carry, tail=True)
   os, m_i, l_i = carry
+  if half:
+    off, w = chunks[-1]
+    l_i = (jnp.sum(jnp.where((off + jnp.arange(w) == d)[None, :], os[-1], 0.0), axis=1) if ones_col
+           else jnp.max(l_i, axis=1))
+    m_i = m_i.astype(jnp.float32)
   if lse_ref is not None:
     # log2 domain, which is what the backward's exp2 wants
     plgpu.store(lse_ref, m_i + jnp.log2(l_i), mask=q_valid)

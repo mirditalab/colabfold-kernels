@@ -98,12 +98,21 @@ def _mgpu_attn():
     return None
 
 
-def _mosaic_or_triton(p, bias, kmask, gate_bias=None, p8=None, *, sm_scale, column=False):
+def _mosaic_or_triton(p, bias, kmask, gate_bias=None, p8=None, *, sm_scale, column=False, out_dtype=None):
   """The Mosaic GPU kernel where it runs, else Triton's. p8 holds the e4m3 slots fp8_attention chose for that kernel."""
   from colabfold_kernels import packed_attn as pa
   if _mosaic_runs(p.shape[-1], p.dtype, p.shape[0 if column else 1]):
     return _mgpu_attn().packed_attention(p, bias, kmask, gate_bias, p8, sm_scale=sm_scale, column=column)
-  return pa.packed_attention(p, bias, kmask, gate_bias, p8, sm_scale=sm_scale, column=column)
+  return pa.packed_attention(p, bias, kmask, gate_bias, p8, sm_scale=sm_scale, column=column, out_dtype=out_dtype)
+
+
+def half_attention(global_config):
+  """Triton's packed attention with its softmax in f16, from a projection written in f16: on Ampere and Hopper, where
+  the f32 softmax is the kernel's bottleneck (A100: 1.2-1.4x); not with FP8, nor where Mosaic GPU runs (sm_12x)."""
+  from colabfold_kernels.device import compute_capability, is_rocm
+  cc = compute_capability()
+  return (global_config.get('half_attention', True) and not global_config.get('fp8', False)
+          and cc is not None and 80 <= cc < 100 and not is_rocm())
 
 
 def packed_attention(global_config, dtype, key_dim, value_dim):
@@ -125,7 +134,9 @@ def packed_attention(global_config, dtype, key_dim, value_dim):
   if not _pallas_half(global_config, dtype):
     return None
   fwd = _mosaic_or_triton if global_config.get('mosaic_gpu', True) else pa.packed_attention
-  return differentiable_via(fwd, ref, nondiff=('sm_scale', 'column'))
+  # a half-softmax p comes in f16; the output stays in the model's dtype
+  call = differentiable_via(fwd, ref, nondiff=('sm_scale', 'column', 'out_dtype'))
+  return functools.partial(call, out_dtype=dtype)
 
 
 def transition(global_config, dtype, num_channel, num_intermediate):
@@ -206,7 +217,12 @@ def ln_projection(global_config, dtype, num_channel, num_output=None):
   from colabfold_kernels import packed_attn as pa
   if not pa.ln_projection_supported(num_channel, num_output):
     return None
-  return differentiable_via(pa.ln_projection, pa.ref_ln_projection, nondiff=('eps', 'f8_slots', 'f8_scales'))
+  call = differentiable_via(pa.ln_projection, pa.ref_ln_projection, nondiff=('eps', 'f8_slots', 'f8_scales', 'p_dtype'))
+  # the packed slots in f16 for the half softmax packed_attention then runs (half_attention); the bias stays in dtype
+  if num_output is not None and half_attention(global_config):
+    import jax.numpy as jnp
+    return functools.partial(call, p_dtype=jnp.float16)
+  return call
 
 
 def output_projection(global_config, dtype, num_input, num_output):
