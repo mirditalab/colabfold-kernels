@@ -78,7 +78,7 @@ def _chunks(d):
 
 
 def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, *rest,
-            sm_scale, block_q, block_k, sq, d, chunks, gated=False, fp8=False, prefix=False, half=False):
+            sm_scale, block_q, block_k, sq, d, chunks, gated=False, fp8=False, prefix=False, half=False, group=1):
   # gated: a gate [block_q, W] and its bias [W] come first, the output is o * sigmoid(gate + bias)
   # fp8: k and v come in e4m3 (fp8_supported), q is cast here, both dots accumulate in fp32
   # prefix: the row's count of leading key blocks with no masked key comes first; those skip the key mask
@@ -97,7 +97,8 @@ def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, *rest,
   # the query rows past Sq are masked on the way in as well as out: the block is block_q rows wherever Sq ends, and
   # in packed_attention's layout a row past the end of the last batch is past the end of p (column attention over
   # one MSA row reads block_q - 1 rows of [Y, G, H, D] beyond it - an illegal address on a single-sequence fold)
-  q_valid = (pl.program_id(0) * block_q + jnp.arange(block_q)) < sq
+  # group: the grid's first axis is a q block's group of batches (packed_attention's grouped order)
+  q_valid = (pl.program_id(0) // group * block_q + jnp.arange(block_q)) < sq
   qs = [plgpu.load(q_ref.at[:, pl.dslice(off, w)],
                    mask=q_valid[:, None] if c is None else q_valid[:, None] & c[None, :], other=0.0)
         for (off, w), c in zip(chunks, cols)]

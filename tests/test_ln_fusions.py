@@ -212,6 +212,11 @@ if compute_capability() is not None and not is_rocm():
       o = pa.packed_attention(p.astype(jnp.float16), bias, kmask, gb, out_dtype=dt, **kw)
       e = rms(o, pa.ref_packed_attention(p, bias, kmask, gb, **kw))
       expect(f"half attention n={n} h={h} d={d} column={column}", o.dtype == dt and e < 5e-3, f"rms {e:.2e}")
+      # the grouped grid order (a last group past the batches included) gives what the plain one does
+      for half in (False, True):
+        pp = p.astype(jnp.float16 if half else dt)
+        o0, o1 = (pa.packed_attention(pp, bias, kmask, gb, out_dtype=dt, group=g, **kw) for g in (0, 16))
+        expect(f"grouped grid n={n} d={d} column={column} half={half}", bool(jnp.all(o0 == o1)), "")
   x, sc, of = f(259, 128, s=2.), f32(128), f32(128)
   w4, wb = f(4, 128, 128, s=.1), f(128, 4, s=.1)
   (ph, bh), (pr, br) = pa.ln_projection(x, sc, of, w4, wb, p_dtype=jnp.float16), pa.ref_ln_projection(x, sc, of, w4, wb)

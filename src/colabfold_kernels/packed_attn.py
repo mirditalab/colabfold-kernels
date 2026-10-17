@@ -23,14 +23,15 @@ _dot = functools.partial(jnp.dot, preferred_element_type=jnp.float32)
 
 
 @functools.partial(jax.jit, static_argnames=(
-    "sm_scale", "column", "block_q", "block_k", "num_warps", "num_stages", "half", "out_dtype"))
+    "sm_scale", "column", "block_q", "block_k", "num_warps", "num_stages", "half", "out_dtype", "group"))
 def packed_attention(p, bias, kmask, gate_bias=None, kv=None, *, sm_scale, column=False, block_q=None,
-                     block_k=None, num_warps=4, num_stages=None, half=None, out_dtype=None):
+                     block_k=None, num_warps=4, num_stages=None, half=None, out_dtype=None, group=None):
   """p [X, Y, G, H, D] (G = 3, or 4 with a gate); bias [H, Sq, Sk]; kmask [batch, Sk] bool;
   gate_bias [H, D] when G == 4. Rows: batch X, sequence Y; column: batch Y, sequence X.
   kv [X, Y, 2, H, D], the k and v slots in e4m3, leaves p with q and the gate: both dots then run e4m3.
   half: the softmax in f16, by default when p is f16 on CUDA (a bf16 p's conversion in the kernel costs what it saves).
-  The output is out_dtype, else p's."""
+  The output is out_dtype, else p's. group: batches a q block runs adjacent (see the grid), 0 for none; by default 16
+  from 20 MB of bias, where a batch's sweep outgrows half an A100's L2, else none."""
   X, Y, G, H, D = p.shape
   half = (p.dtype == jnp.float16 and kv is None and not is_rocm()) if half is None else half
   assert not (half and kv is not None)
@@ -47,16 +48,30 @@ def packed_attention(p, bias, kmask, gate_bias=None, kv=None, *, sm_scale, colum
   fp8 = kv is not None
   assert not fp8 or fp8_supported(D, block_k), (D, block_k)
   num_stages = num_stages or (3 if column else 2)
-  # grid (q_block, head, batch): batch innermost keeps bias[h, q_block, :] hot in L2.
-  grid = (pl.cdiv(s, block_q), H, nb)
-  if column:
-    q_spec = lambda slot: pl.BlockSpec((block_q, None, None, None, dk), lambda i, h, j: (i, j, slot, h, 0))
-    kv_spec = lambda slot: pl.BlockSpec((s, None, None, None, dk), lambda i, h, j: (0, j, slot, h, 0))
-    o_spec = pl.BlockSpec((block_q, None, None, dk), lambda i, h, j: (i, j, h, 0))
+  # CUDA runs the grid's first axis fastest. grid (q_block, head, batch) sweeps every head's q blocks for one batch, so
+  # each batch reads the whole bias; group G: (G batches x q_block, head, batch group), a q block's G batches adjacent
+  # (one bias tile read for G) and a group's K/V in L2 across its q blocks
+  nq = pl.cdiv(s, block_q)
+  if group is None:
+    # A100 (40 MB L2): 2,616 rows 1.25x, columns 1.33x; 2,088 (35 MB of bias) 1.05x / 1.24x; 1,568 (20 MB) level;
+    # 1,048 (9 MB) 10% slower grouped. jax does not report the L2, hence the one constant
+    group = 16 if not is_rocm() and H * s * s * 2 >= 20 << 20 else 0
+  if group:
+    grid = (group * nq, H, pl.cdiv(nb, group))
+    # a last group's batches past nb repeat the last one: the same output written twice
+    idx = lambda x, h, g: (x // group, h, jnp.minimum(g * group + x % group, nb - 1))
   else:
-    q_spec = lambda slot: pl.BlockSpec((None, block_q, None, None, dk), lambda i, h, j: (j, i, slot, h, 0))
-    kv_spec = lambda slot: pl.BlockSpec((None, s, None, None, dk), lambda i, h, j: (j, 0, slot, h, 0))
-    o_spec = pl.BlockSpec((None, block_q, None, dk), lambda i, h, j: (j, i, h, 0))
+    grid = (nq, H, nb)
+    idx = lambda i, h, j: (i, h, j)
+  at = lambda f: (lambda *a: f(*idx(*a)))
+  if column:
+    q_spec = lambda slot: pl.BlockSpec((block_q, None, None, None, dk), at(lambda i, h, j: (i, j, slot, h, 0)))
+    kv_spec = lambda slot: pl.BlockSpec((s, None, None, None, dk), at(lambda i, h, j: (0, j, slot, h, 0)))
+    o_spec = pl.BlockSpec((block_q, None, None, dk), at(lambda i, h, j: (i, j, h, 0)))
+  else:
+    q_spec = lambda slot: pl.BlockSpec((None, block_q, None, None, dk), at(lambda i, h, j: (j, i, slot, h, 0)))
+    kv_spec = lambda slot: pl.BlockSpec((None, s, None, None, dk), at(lambda i, h, j: (j, 0, slot, h, 0)))
+    o_spec = pl.BlockSpec((None, block_q, None, dk), at(lambda i, h, j: (j, i, h, 0)))
   # tri_flash's kernel: the BlockSpecs pick q/k/v/gate out of p, the kernel never sees the packing
   # the array and slot each of k, v and the gate is read from
   (ka, ks), (va, vs), gs = ((p, 1), (p, 2), 3) if kv is None else ((kv, 0), (kv, 1), 1)
@@ -66,19 +81,19 @@ def packed_attention(p, bias, kmask, gate_bias=None, kv=None, *, sm_scale, colum
   # half: the bias in f16 in the log2 domain, negated (the kernel subtracts it)
   bias = (bias.astype(jnp.float32) * -LOG2E).astype(jnp.float16) if half else bias.astype(p.dtype)
   bias = jnp.pad(bias, ((0, 0), (0, 0), (0, sp - s)))
-  in_specs = [q_spec(0), kv_spec(ks), kv_spec(vs), pl.BlockSpec((None, block_q, sp), lambda i, h, j: (h, i, 0)),
-              pl.BlockSpec((None, s), lambda i, h, j: (j, 0))]
+  in_specs = [q_spec(0), kv_spec(ks), kv_spec(vs), pl.BlockSpec((None, block_q, sp), at(lambda i, h, j: (h, i, 0))),
+              pl.BlockSpec((None, s), at(lambda i, h, j: (j, 0)))]
   args = [p, ka, va, bias, kmask]
   # leading key blocks with no masked key skip the mask (ColabFold masks padding only): -25% loop instructions on sm_80
   lead = jnp.where(kmask.all(axis=1), s, jnp.argmin(kmask, axis=1))
-  in_specs.append(pl.BlockSpec((1,), lambda i, h, j: (j,)))
+  in_specs.append(pl.BlockSpec((1,), at(lambda i, h, j: (j,))))
   args.append((lead // block_k).astype(jnp.int32))
   if gated:
-    in_specs += [q_spec(gs), pl.BlockSpec((None, dk), lambda i, h, j: (h, 0))]
+    in_specs += [q_spec(gs), pl.BlockSpec((None, dk), at(lambda i, h, j: (h, 0)))]
     args += [p, gate_bias]
   return pl.pallas_call(
       functools.partial(_kernel, sm_scale=sm_scale, block_q=block_q, block_k=block_k, sq=s, d=D,
-                        chunks=chunks, gated=gated, fp8=fp8, prefix=True, half=half),
+                        chunks=chunks, gated=gated, fp8=fp8, prefix=True, half=half, group=group or 1),
       grid=grid,
       in_specs=in_specs,
       out_specs=o_spec,
