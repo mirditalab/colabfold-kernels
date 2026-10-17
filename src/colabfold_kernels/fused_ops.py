@@ -63,7 +63,11 @@ def fp8_attention(global_config, key_dim):
 
 @functools.lru_cache(maxsize=None)
 def _mgpu_attn():
-  """mgpu_attn on sm_12x, None elsewhere or when this jax's Mosaic GPU API does not match."""
+  """mgpu_attn on sm_12x, None elsewhere or when this jax's Mosaic GPU API does not match.
+
+  A failure on sm_12x is logged, because the Triton fallback is otherwise silent - with the jax ColabFold 1.6.3
+  resolves (0.10.2) it is what an RTX PRO 6000 runs.
+  """
   from colabfold_kernels.device import compute_capability
   cc = compute_capability()
   if cc is None or not 120 <= cc < 130:
@@ -78,7 +82,12 @@ def _mgpu_attn():
         sds((8, 64, 4, 2, 32), jnp.bfloat16), sds((2, 64, 64), jnp.bfloat16), sds((8, 64), jnp.bool_),
         sds((2, 32), jnp.bfloat16)).compile()
     return mgpu_attn
-  except Exception:
+  except Exception as e:
+    import logging
+    import jax
+    logging.getLogger(__name__).warning(
+        "Mosaic GPU attention is unavailable on sm_%d with jax %s, so packed attention runs on Triton: %s: %s",
+        cc, jax.__version__, type(e).__name__, str(e).splitlines()[0] if str(e) else "")
     return None
 
 
