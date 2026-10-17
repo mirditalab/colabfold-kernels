@@ -10,6 +10,8 @@ import jax, jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
+from colabfold_kernels.device import is_rocm
+
 # jnp.dot is stable across jax versions, contrary to pl.dot/plgpu.dot
 _dot = functools.partial(jnp.dot, preferred_element_type=jnp.float32)
 
@@ -23,6 +25,15 @@ P_SHIFT = 8.0
 def e4m3(x):
   """x rounded to float8 e4m3, saturating: the format has no infinity, so an unclipped cast past 448 gives NaN."""
   return jnp.clip(x.astype(jnp.float32), -E4M3_MAX, E4M3_MAX).astype(jnp.float8_e4m3fn)
+
+
+def exp2(x):
+  """In a kernel: 2^x as one ex2.approx.ftz.f32 on CUDA; jnp.exp2's libdevice call adds a denormal fixup around it."""
+  if is_rocm() or x.dtype != jnp.float32:
+    return jnp.exp2(x)
+  [r] = plgpu.elementwise_inline_asm("ex2.approx.ftz.f32 $0, $1;", args=[x], constraints="=f,f", pack=1,
+                                     result_shape_dtypes=[jax.ShapeDtypeStruct(x.shape, x.dtype)])
+  return r
 
 
 def _and(a, b):
@@ -105,8 +116,9 @@ def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, *rest,
       qk = jnp.where(km[None, :], qk, NEG if kb is None else jnp.where(kb, NEG, -jnp.inf)[None, :])
     m_curr = jnp.max(qk, axis=-1)
     m_next = jnp.maximum(m_prev, m_curr)
-    corr = jnp.exp2(m_prev - m_next)
-    s = jnp.exp2(qk - m_next[:, None] + (P_SHIFT if fp8 else 0.0))
+    corr = exp2(m_prev - m_next)
+    # FP8's shift goes into the row max, once a row instead of 1 FADD a score
+    s = exp2(qk - (m_next - P_SHIFT if fp8 else m_next)[:, None])
     l_next = corr * l_prev + s.sum(axis=-1)
     o_next = []
     for oc, (off, w), c in zip(o_prev, chunks, cols):
