@@ -230,9 +230,18 @@ def ln_projection(x, ln_scale, ln_offset, w=None, wb=None, keep=None, *, eps=1e-
   f8_scales = f8_scales or (1.0,) * len(f8_slots)
   m, a = x.shape
   # swept on the L40S at the triangle attention's 4 x 128 outputs: 30% over 64 rows x 4 warps; on the A100 64 x 4 is
-  # 1.6-1.8x over that up to 128 channels, 32 x 4 1.15x at 256 (where 64 x 4 is 2.4x slower)
+  # 1.6-1.8x over that up to 128 channels, 32 x 4 1.15x at 256 (where 64 x 4 is 2.4x slower); on sm_120 at 128 channels
+  # 64 x 8 is 1.39x over 32 x 8 at 1,024 tokens (1.45 -> 1.04 ms) and 1.37x at 512 (weights re-read from L2 per block)
   if block_m is None or num_warps is None:
-    m_, w_ = ((64, 4) if a <= 128 else (32, 4)) if compute_capability() == 80 else (32, 8)
+    cc = compute_capability()
+    if cc == 80 and a <= 128:
+      m_, w_ = 64, 4
+    elif cc == 80:
+      m_, w_ = 32, 4
+    elif cc is not None and 120 <= cc < 130 and a <= 128:
+      m_, w_ = 64, 8
+    else:
+      m_, w_ = 32, 8
     block_m, num_warps = block_m or m_, num_warps or w_
   slots = 0 if w is None else w.shape[0]
   heads = 0 if wb is None else wb.shape[1]
