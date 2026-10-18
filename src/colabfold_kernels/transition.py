@@ -26,6 +26,17 @@ def ln_rows(x, scale_ref, offset_ref, eps):
   return y * scale_ref[...][None, :].astype(jnp.float32) + offset_ref[...][None, :].astype(jnp.float32)
 
 
+def unless_padding(keep_ref, rows, compute, padding):
+  """In a kernel: compute() for a row block with a row keep_ref marks, padding() for one with none (the bucket's
+  padding: its rows then skip the work and get what padding() stores). keep_ref None: always compute()."""
+  if keep_ref is None:
+    compute()
+    return
+  live = jnp.max(jnp.abs(plgpu.load(keep_ref, mask=rows, other=0).astype(jnp.float32))) > 0
+  pl.when(live)(compute)
+  pl.when(jnp.logical_not(live))(padding)
+
+
 def sigmoid(x):
   """In a kernel: sigmoid as 0.5 + 0.5 tanh(x / 2), one MUFU.TANH on CUDA instead of an exp and an IEEE divide."""
   if is_rocm():
@@ -125,22 +136,30 @@ def _glu_kernel(x_ref, s_ref, o_ref_ln, wa_ref, wb_ref, wo_ref, *refs, eps, m, b
                 activation):
   keep_ref, o_ref = refs if len(refs) == 2 else (None,) + refs
   rows = (pl.program_id(0) * block_m + jnp.arange(block_m)) < m
-  x = plgpu.load(x_ref, mask=rows[:, None], other=0.0).astype(jnp.float32)
-  y = ln_rows(x, s_ref, o_ref_ln, eps)
-  y = y.astype(wa_ref.dtype)
 
-  def body(k, acc):
-    ks = pl.ds(pl.multiple_of(k * chunk, chunk), chunk)
-    h = fast(activation)(_dot(y, wa_ref[:, ks])) * _dot(y, wb_ref[:, ks])
-    return acc + _dot(h.astype(wo_ref.dtype), wo_ref[ks, :])
+  def compute():
+    x = plgpu.load(x_ref, mask=rows[:, None], other=0.0).astype(jnp.float32)
+    y = ln_rows(x, s_ref, o_ref_ln, eps)
+    y = y.astype(wa_ref.dtype)
 
-  acc = jnp.zeros((block_m, wo_ref.shape[1]), jnp.float32)
-  acc = jax.lax.fori_loop(0, wa_ref.shape[1] // chunk, body, acc)
-  if keep_ref is not None:
-    acc = acc * plgpu.load(keep_ref, mask=rows, other=0.0).astype(jnp.float32)[:, None]
-  if add_input:
-    acc = acc + x
-  plgpu.store(o_ref, acc.astype(o_ref.dtype), mask=rows[:, None])
+    def body(k, acc):
+      ks = pl.ds(pl.multiple_of(k * chunk, chunk), chunk)
+      h = fast(activation)(_dot(y, wa_ref[:, ks])) * _dot(y, wb_ref[:, ks])
+      return acc + _dot(h.astype(wo_ref.dtype), wo_ref[ks, :])
+
+    acc = jnp.zeros((block_m, wo_ref.shape[1]), jnp.float32)
+    acc = jax.lax.fori_loop(0, wa_ref.shape[1] // chunk, body, acc)
+    if keep_ref is not None:
+      acc = acc * plgpu.load(keep_ref, mask=rows, other=0.0).astype(jnp.float32)[:, None]
+    if add_input:
+      acc = acc + x
+    plgpu.store(o_ref, acc.astype(o_ref.dtype), mask=rows[:, None])
+
+  def padding():  # keep 0 on every row: what compute() gives them, without the transition
+    out = plgpu.load(x_ref, mask=rows[:, None], other=0.0) if add_input else jnp.zeros(o_ref.shape, o_ref.dtype)
+    plgpu.store(o_ref, out.astype(o_ref.dtype), mask=rows[:, None])
+
+  unless_padding(keep_ref, rows, compute, padding)
 
 
 def glu_supported(c, hdim):
@@ -154,6 +173,7 @@ def fused_glu_transition(x, ln_scale, ln_offset, wa, wb, wo, keep=None, *, eps=1
   """AF3's transition: LN(x) -> activation(. @ wa) * (. @ wb) -> @ wo, no biases; x [..., C], wa/wb [C, H], wo [H, C].
 
   keep [...] scales each output row (OpenFold3's output mask); add_input returns x + that from the tile already loaded.
+  A row block keep zeroes entirely skips the transition (the bucket's padding).
   """
   c, hdim = x.shape[-1], wa.shape[1]
   assert glu_supported(c, hdim), (c, hdim)

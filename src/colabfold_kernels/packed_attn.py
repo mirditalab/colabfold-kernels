@@ -16,7 +16,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
 from colabfold_kernels.device import compute_capability, is_rocm, l2_cache_size
-from colabfold_kernels.transition import ln_rows, ref_ln
+from colabfold_kernels.transition import ln_rows, ref_ln, unless_padding
 from colabfold_kernels.tri_flash import LOG2E, NEG, _chunks, _kernel, _pow2_tile, e4m3, fp8_supported
 
 _dot = functools.partial(jnp.dot, preferred_element_type=jnp.float32)
@@ -172,45 +172,60 @@ def ln_projection_supported(a, n=None):
   return a & (a - 1) == 0 and 16 <= a <= 256 and (n is None or projection_supported(n) or n in (256, 384, 512))
 
 
-def _ln_proj_kernel(x_ref, s_ref, offset_ref, *refs, eps, m, block_m, slots, heads, f8_slots, f8_scales):
-  # refs: w [slots, a, n] if slots, wb [heads, a] if heads, then the outputs in the same order, the e4m3 one last
+def _ln_proj_kernel(x_ref, s_ref, offset_ref, *refs, eps, m, block_m, slots, heads, f8_slots, f8_scales, keep):
+  # refs: w [slots, a, n] if slots, wb [heads, a] if heads, keep [block_m] if keep, then the outputs in the same order,
+  # the e4m3 one last
   refs = list(refs)
   w_ref = refs.pop(0) if slots else None
   wb_ref = refs.pop(0) if heads else None
+  keep_ref = refs.pop(0) if keep else None
   p_ref = refs.pop(0) if slots else None
   b_ref = refs.pop(0) if heads else None
   p8_ref = refs.pop(0) if f8_slots else None
   rows = (pl.program_id(0) * block_m + jnp.arange(block_m)) < m
-  x = plgpu.load(x_ref, mask=rows[:, None], other=0.0).astype(jnp.float32)
-  y = ln_rows(x, s_ref, offset_ref, eps).astype(x_ref.dtype)
-  half = [g for g in range(slots) if g not in f8_slots]
-  n = w_ref.shape[2] if slots else 0
-  # a slot past 128 columns as several dots on the same normed tile: a whole one would outgrow shared memory
-  chunk = min(n, 128)
-  for g in range(slots):
-    for c0 in range(0, n, chunk):
-      out = _dot(y, w_ref[g, :, pl.ds(c0, chunk)])
-      if g in f8_slots:
-        i = f8_slots.index(g)
-        plgpu.store(p8_ref.at[:, pl.ds(i * n + c0, chunk)], e4m3(out * f8_scales[i]), mask=rows[:, None])
-      else:
-        plgpu.store(p_ref.at[:, pl.ds(half.index(g) * n + c0, chunk)], out.astype(p_ref.dtype), mask=rows[:, None])
-  for h in range(heads):
-    # a few heads: row reductions, a dot would pad them to 16 columns
-    b = jnp.sum(y.astype(jnp.float32) * wb_ref[h][None, :].astype(jnp.float32), axis=1)
-    plgpu.store(b_ref.at[h], b.astype(b_ref.dtype), mask=rows)
+  outs = [r for r in (p_ref, p8_ref) if r is not None]
+
+  def compute():
+    x = plgpu.load(x_ref, mask=rows[:, None], other=0.0).astype(jnp.float32)
+    y = ln_rows(x, s_ref, offset_ref, eps).astype(x_ref.dtype)
+    half = [g for g in range(slots) if g not in f8_slots]
+    n = w_ref.shape[2] if slots else 0
+    # a slot past 128 columns as several dots on the same normed tile: a whole one would outgrow shared memory
+    chunk = min(n, 128)
+    for g in range(slots):
+      for c0 in range(0, n, chunk):
+        out = _dot(y, w_ref[g, :, pl.ds(c0, chunk)])
+        if g in f8_slots:
+          i = f8_slots.index(g)
+          plgpu.store(p8_ref.at[:, pl.ds(i * n + c0, chunk)], e4m3(out * f8_scales[i]), mask=rows[:, None])
+        else:
+          plgpu.store(p_ref.at[:, pl.ds(half.index(g) * n + c0, chunk)], out.astype(p_ref.dtype),
+                      mask=rows[:, None])
+    for h in range(heads):
+      # a few heads: row reductions, a dot would pad them to 16 columns
+      b = jnp.sum(y.astype(jnp.float32) * wb_ref[h][None, :].astype(jnp.float32), axis=1)
+      plgpu.store(b_ref.at[h], b.astype(b_ref.dtype), mask=rows)
+
+  def padding():  # rows keep leaves out: zeros
+    for o in outs:
+      plgpu.store(o, jnp.zeros(o.shape, jnp.float32).astype(o.dtype), mask=rows[:, None])
+    if b_ref is not None:
+      plgpu.store(b_ref, jnp.zeros(b_ref.shape, b_ref.dtype), mask=rows[None, :])
+
+  unless_padding(keep_ref, rows, compute, padding)
 
 
 @functools.partial(jax.jit, static_argnames=("eps", "block_m", "num_warps", "num_stages", "f8_slots", "f8_scales",
                                              "p_dtype"))
-def ln_projection(x, ln_scale, ln_offset, w=None, wb=None, *, eps=1e-5, block_m=None, num_warps=None, num_stages=2,
-                  f8_slots=(), f8_scales=None, p_dtype=None):
+def ln_projection(x, ln_scale, ln_offset, w=None, wb=None, keep=None, *, eps=1e-5, block_m=None, num_warps=None,
+                  num_stages=2, f8_slots=(), f8_scales=None, p_dtype=None):
   """LN(x) projected by each slot of w and by wb, from one read of x [M, a].
 
   w [G, a, n] gives p [M, G*n], the packed projection; wb [a, h] gives the bias channel-major [h, M].
   Returns (p, bias), None for an absent weight. f8_slots, slots of w written e4m3 to a third output
   [M, len(f8_slots)*n] in that order, leave p with the others; f8_scales, one a slot, scale them before rounding.
   p_dtype: p's dtype, else x's (f16 for packed_attention's half softmax).
+  keep [M]: the rows that matter; a row block with none (the bucket's padding) writes zeros without the work.
   """
   f8_scales = f8_scales or (1.0,) * len(f8_slots)
   m, a = x.shape
@@ -234,12 +249,15 @@ def ln_projection(x, ln_scale, ln_offset, w=None, wb=None, *, eps=1e-5, block_m=
     args.append(wb.T)
     out_specs.append(pl.BlockSpec((heads, block_m), lambda i: (0, i)))
     out_shape.append(jax.ShapeDtypeStruct((heads, m), x.dtype))
+  if keep is not None:
+    in_specs.append(pl.BlockSpec((block_m,), lambda i: (i,)))
+    args.append(keep.reshape(m))
   if f8_slots:
     out_specs.append(pl.BlockSpec((block_m, len(f8_slots) * n), lambda i: (i, 0)))
     out_shape.append(jax.ShapeDtypeStruct((m, len(f8_slots) * n), jnp.float8_e4m3fn))
   out = pl.pallas_call(
       functools.partial(_ln_proj_kernel, eps=eps, m=m, block_m=block_m, slots=slots, heads=heads,
-                        f8_slots=f8_slots, f8_scales=f8_scales),
+                        f8_slots=f8_slots, f8_scales=f8_scales, keep=keep is not None),
       grid=(pl.cdiv(m, block_m),),
       in_specs=in_specs,
       out_specs=out_specs,
@@ -252,7 +270,8 @@ def ln_projection(x, ln_scale, ln_offset, w=None, wb=None, *, eps=1e-5, block_m=
   return (p, b, out.pop(0)) if f8_slots else (p, b)
 
 
-def ref_ln_projection(x, ln_scale, ln_offset, w=None, wb=None, *, eps=1e-5, f8_slots=(), f8_scales=None, p_dtype=None):
+def ref_ln_projection(x, ln_scale, ln_offset, w=None, wb=None, keep=None, *, eps=1e-5, f8_slots=(), f8_scales=None,
+                      p_dtype=None):
   y = ref_ln(x.astype(jnp.float32), ln_scale, ln_offset, eps)
   b = None if wb is None else (y @ wb.astype(jnp.float32)).T
   if w is None:
@@ -264,20 +283,31 @@ def ref_ln_projection(x, ln_scale, ln_offset, w=None, wb=None, *, eps=1e-5, f8_s
   return (flat(half), b, flat(f8_slots) * scale) if f8_slots else (flat(half), b)
 
 
-def _out_proj_kernel(o_ref, w_ref, b_ref, *rest, m, block_m, block_k):
-  r_ref, out_ref = rest if len(rest) == 2 else (None, rest[0])
+def _out_proj_kernel(o_ref, w_ref, b_ref, *rest, m, block_m, block_k, residual, keep):
+  rest = list(rest)
+  r_ref = rest.pop(0) if residual else None
+  keep_ref = rest.pop(0) if keep else None
+  out_ref, = rest
   rows = (pl.program_id(0) * block_m + jnp.arange(block_m)) < m
 
-  # the weight streamed block_k rows at a time: a whole one past 128 channels outgrows shared memory
-  def body(k, acc):
-    ks = pl.ds(pl.multiple_of(k * block_k, block_k), block_k)
-    return acc + _dot(plgpu.load(o_ref.at[:, ks], mask=rows[:, None], other=0.0), w_ref[ks, :])
+  def compute():
+    # the weight streamed block_k rows at a time: a whole one past 128 channels outgrows shared memory
+    def body(k, acc):
+      ks = pl.ds(pl.multiple_of(k * block_k, block_k), block_k)
+      return acc + _dot(plgpu.load(o_ref.at[:, ks], mask=rows[:, None], other=0.0), w_ref[ks, :])
 
-  acc = jnp.zeros((block_m, w_ref.shape[1]), jnp.float32)
-  out = jax.lax.fori_loop(0, o_ref.shape[1] // block_k, body, acc) + b_ref[...][None, :].astype(jnp.float32)
-  if r_ref is not None:
-    out = out + plgpu.load(r_ref, mask=rows[:, None], other=0.0).astype(jnp.float32)
-  plgpu.store(out_ref, out.astype(out_ref.dtype), mask=rows[:, None])
+    acc = jnp.zeros((block_m, w_ref.shape[1]), jnp.float32)
+    out = jax.lax.fori_loop(0, o_ref.shape[1] // block_k, body, acc) + b_ref[...][None, :].astype(jnp.float32)
+    if r_ref is not None:
+      out = out + plgpu.load(r_ref, mask=rows[:, None], other=0.0).astype(jnp.float32)
+    plgpu.store(out_ref, out.astype(out_ref.dtype), mask=rows[:, None])
+
+  def padding():  # rows keep leaves out: the residual as it was, else zeros
+    out = (plgpu.load(r_ref, mask=rows[:, None], other=0.0) if r_ref is not None
+           else jnp.zeros(out_ref.shape, out_ref.dtype))
+    plgpu.store(out_ref, out.astype(out_ref.dtype), mask=rows[:, None])
+
+  unless_padding(keep_ref, rows, compute, padding)
 
 
 def output_projection_supported(k, c):
@@ -286,10 +316,11 @@ def output_projection_supported(k, c):
 
 
 @functools.partial(jax.jit, static_argnames=("block_m", "num_warps", "num_stages"))
-def output_projection(o, w, b, residual=None, *, block_m=64, num_warps=None, num_stages=2):
+def output_projection(o, w, b, residual=None, keep=None, *, block_m=64, num_warps=None, num_stages=2):
   """o [M, k] @ w [k, c] + b, plus residual [M, c] when given, in one pass.
 
-  The result has residual's dtype, else o's.
+  The result has residual's dtype, else o's. keep [M]: the rows that matter; a row block with none (the bucket's
+  padding) writes the residual unchanged, else zeros, without the work.
   """
   m, k = o.shape
   c = w.shape[1]
@@ -297,11 +328,16 @@ def output_projection(o, w, b, residual=None, *, block_m=64, num_warps=None, num
   num_warps = num_warps or (8 if c > 128 else 4)
   rows = pl.BlockSpec((block_m, c), lambda i: (i, 0))
   extra = [] if residual is None else [residual]
+  specs = [rows] * len(extra)
+  if keep is not None:
+    extra.append(keep.reshape(m))
+    specs.append(pl.BlockSpec((block_m,), lambda i: (i,)))
   return pl.pallas_call(
-      functools.partial(_out_proj_kernel, m=m, block_m=block_m, block_k=block_k),
+      functools.partial(_out_proj_kernel, m=m, block_m=block_m, block_k=block_k, residual=residual is not None,
+                        keep=keep is not None),
       grid=(pl.cdiv(m, block_m),),
       in_specs=[pl.BlockSpec((block_m, k), lambda i: (i, 0)), pl.BlockSpec((k, c), lambda i: (0, 0)),
-                pl.BlockSpec((c,), lambda i: (0,))] + [rows] * len(extra),
+                pl.BlockSpec((c,), lambda i: (0,))] + specs,
       out_specs=rows,
       out_shape=jax.ShapeDtypeStruct((m, c), o.dtype if residual is None else residual.dtype),
       compiler_params=plgpu.CompilerParams(num_warps=num_warps, num_stages=num_stages),
@@ -309,6 +345,6 @@ def output_projection(o, w, b, residual=None, *, block_m=64, num_warps=None, num
   )(o, w, b, *extra)
 
 
-def ref_output_projection(o, w, b, residual=None):
+def ref_output_projection(o, w, b, residual=None, keep=None):
   out = o.astype(jnp.float32) @ w.astype(jnp.float32) + b.astype(jnp.float32)
   return out if residual is None else out + residual.astype(jnp.float32)

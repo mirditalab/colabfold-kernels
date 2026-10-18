@@ -15,7 +15,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
 from colabfold_kernels.device import is_rocm, shared_memory_limit
-from colabfold_kernels.transition import fast, ln_rows, ref_ln, sigmoid
+from colabfold_kernels.transition import fast, ln_rows, ref_ln, sigmoid, unless_padding
 from colabfold_kernels.tri_flash import e4m3
 
 # jnp.dot is stable across jax versions, contrary to pl.dot/plgpu.dot
@@ -79,15 +79,12 @@ def _ln_gdp_kernel(x_ref, s_ref, offset_ref, wpl_ref, bpl_ref, wgl_ref, bgl_ref,
   mask = plgpu.load(mask_ref, mask=rows, other=0)
   cast = e4m3 if fp8 else (lambda t: t.astype(ol_ref.dtype))
   halves = ((wpl_ref, bpl_ref, wgl_ref, bgl_ref, ol_ref), (wpr_ref, bpr_ref, wgr_ref, bgr_ref, or_ref))
-  live = jnp.max(jnp.abs(mask.astype(jnp.float32))) > 0
 
-  @pl.when(jnp.logical_not(live))
-  def _padding():
+  def padding():
     for *_, o in halves:
       plgpu.store(o, cast(jnp.zeros(o.shape, jnp.float32)), mask=out_rows[None, :])
 
-  @pl.when(live)
-  def _rows():
+  def compute():
     x = plgpu.load(x_ref, mask=rows[:, None], other=0.0).astype(jnp.float32)
     x = ln_rows(x, s_ref, offset_ref, eps).astype(x_ref.dtype)
     if chunk is None:
@@ -104,6 +101,8 @@ def _ln_gdp_kernel(x_ref, s_ref, offset_ref, wpl_ref, bpl_ref, wgl_ref, bgl_ref,
       return carry
 
     jax.lax.fori_loop(0, ol_ref.shape[0] // chunk, body, 0)
+
+  unless_padding(mask_ref, rows, compute, padding)
 
 
 def _gdp_kernel_split(x_ref, wpl_ref, bpl_ref, wgl_ref, bgl_ref,
@@ -300,13 +299,30 @@ def ref_ln_gdp(x, ln_scale, ln_offset, wp, bp, wg, bg, mask, *, eps=1e-5, transp
 
 
 def _epilogue_kernel(x_ref, a_ref, s_ref, o_ref_ln, wo_ref, bo_ref, wg_ref, bg_ref, *rest,
-                     eps, m, block_m, input_ln=False, add_input=False):
+                     eps, m, block_m, input_ln=False, add_input=False, residual=False, keep=False, chunk=None):
   # input_ln: a_ref is the raw module input and rest leads with its LayerNorm's scale and offset
-  as_ref, ao_ref = rest[:2] if input_ln else (None, None)
-  rest = rest[2:] if input_ln else rest
-  r_ref, o_ref = rest if len(rest) == 2 else (None, rest[0])
+  # chunk: the output columns stream in chunks (_epilogue_stream_rows), for widths whose whole weights do not fit
+  rest = list(rest)
+  as_ref, ao_ref = (rest.pop(0), rest.pop(0)) if input_ln else (None, None)
+  r_ref = rest.pop(0) if residual else None
+  keep_ref = rest.pop(0) if keep else None
+  o_ref, = rest
   # x_ref [C, block_m] channel-major triangle product; a_ref [block_m, Ca] normed input
   rows = (pl.program_id(0) * block_m + jnp.arange(block_m)) < m
+  refs = (x_ref, a_ref, s_ref, o_ref_ln, wo_ref, bo_ref, wg_ref, bg_ref, as_ref, ao_ref, r_ref, o_ref, rows, eps)
+  compute = (functools.partial(_epilogue_rows, *refs, input_ln, add_input) if chunk is None
+             else functools.partial(_epilogue_stream_rows, *refs, chunk, input_ln, add_input))
+
+  def padding():  # rows keep leaves out: the residual as it was (add_input's raw input, else residual), else zeros
+    src = a_ref if add_input else r_ref
+    out = plgpu.load(src, mask=rows[:, None], other=0.0) if src is not None else jnp.zeros(o_ref.shape, o_ref.dtype)
+    plgpu.store(o_ref, out.astype(o_ref.dtype), mask=rows[:, None])
+
+  unless_padding(keep_ref, rows, compute, padding)
+
+
+def _epilogue_rows(x_ref, a_ref, s_ref, o_ref_ln, wo_ref, bo_ref, wg_ref, bg_ref, as_ref, ao_ref, r_ref, o_ref, rows,
+                   eps, input_ln, add_input):
   x = plgpu.load(x_ref, mask=rows[None, :], other=0.0).astype(jnp.float32).T
   y = ln_rows(x, s_ref, o_ref_ln, eps)
   out = _dot(y.astype(wo_ref.dtype), wo_ref[...]) + bo_ref[...][None, :].astype(jnp.float32)
@@ -323,13 +339,9 @@ def _epilogue_kernel(x_ref, a_ref, s_ref, o_ref_ln, wo_ref, bo_ref, wg_ref, bg_r
   plgpu.store(o_ref, out.astype(o_ref.dtype), mask=rows[:, None])
 
 
-def _epilogue_stream_kernel(x_ref, a_ref, s_ref, o_ref_ln, wo_ref, bo_ref, wg_ref, bg_ref, *rest,
-                            eps, m, block_m, chunk, input_ln=False, add_input=False):
-  # _epilogue_kernel for widths whose whole weights do not fit: the normed rows stay, the output columns stream
-  as_ref, ao_ref = rest[:2] if input_ln else (None, None)
-  rest = rest[2:] if input_ln else rest
-  r_ref, o_ref = rest if len(rest) == 2 else (None, rest[0])
-  rows = (pl.program_id(0) * block_m + jnp.arange(block_m)) < m
+def _epilogue_stream_rows(x_ref, a_ref, s_ref, o_ref_ln, wo_ref, bo_ref, wg_ref, bg_ref, as_ref, ao_ref, r_ref, o_ref,
+                          rows, eps, chunk, input_ln, add_input):
+  # _epilogue_rows for widths whose whole weights do not fit: the normed rows stay, the output columns stream
   x = plgpu.load(x_ref, mask=rows[None, :], other=0.0).astype(jnp.float32).T
   y = ln_rows(x, s_ref, o_ref_ln, eps).astype(wo_ref.dtype)
   a = plgpu.load(a_ref, mask=rows[:, None], other=0.0)
@@ -376,7 +388,7 @@ def trimul_epilogue(x_cm, act, ln_scale, ln_offset, wo, bo, wg, bg, residual=Non
 
 
 def _epilogue(x_cm, act, params, extra, dtype, *, eps, block_m, num_warps, num_stages, input_ln=False,
-              add_input=False):
+              add_input=False, keep=None):
   c, m = x_cm.shape
   ca, o = act.shape[1], params[2].shape[1]
   stream = not epilogue_supported(c, ca, o)
@@ -386,8 +398,8 @@ def _epilogue(x_cm, act, params, extra, dtype, *, eps, block_m, num_warps, num_s
     smem = None if is_rocm() else shared_memory_limit()
     while smem and block_m > 16 and block_m * max(c, ca, o) * 5 > smem:
       block_m //= 2
-  kernel = functools.partial(_epilogue_stream_kernel if stream else _epilogue_kernel, eps=eps, m=m, block_m=block_m,
-                             input_ln=input_ln, add_input=add_input, **({"chunk": chunk} if stream else {}))
+  kernel = functools.partial(_epilogue_kernel, eps=eps, m=m, block_m=block_m, input_ln=input_ln, add_input=add_input,
+                             residual=bool(extra), keep=keep is not None, chunk=chunk if stream else None)
   vec = lambda n: pl.BlockSpec((n,), lambda i: (0,))
   rows = pl.BlockSpec((block_m, o), lambda i: (i, 0))
   return pl.pallas_call(
@@ -397,30 +409,33 @@ def _epilogue(x_cm, act, params, extra, dtype, *, eps, block_m, num_warps, num_s
                 pl.BlockSpec((block_m, ca), lambda i: (i, 0)), vec(c), vec(c),
                 pl.BlockSpec((c, o), lambda i: (0, 0)), vec(o),
                 pl.BlockSpec((ca, o), lambda i: (0, 0)), vec(o)]
-               + [vec(ca)] * (2 if input_ln else 0) + [rows] * len(extra),
+               + [vec(ca)] * (2 if input_ln else 0) + [rows] * len(extra)
+               + ([] if keep is None else [pl.BlockSpec((block_m,), lambda i: (i,))]),
       out_specs=rows,
       out_shape=jax.ShapeDtypeStruct((m, o), dtype),
       compiler_params=plgpu.CompilerParams(num_warps=num_warps, num_stages=num_stages),
       name="trimul_epilogue",
-  )(x_cm, act, *params, *extra)
+  )(x_cm, act, *params, *extra, *([] if keep is None else [keep.reshape(m)]))
 
 
 @functools.partial(jax.jit, static_argnames=("eps", "add_input", "block_m", "num_warps", "num_stages"))
-def trimul_epilogue_ln(x_cm, x, in_scale, in_offset, ln_scale, ln_offset, wo, bo, wg, bg, *, eps=1e-5,
+def trimul_epilogue_ln(x_cm, x, in_scale, in_offset, ln_scale, ln_offset, wo, bo, wg, bg, keep=None, *, eps=1e-5,
                        add_input=False, block_m=64, num_warps=4, num_stages=2):
   """trimul_epilogue gated by LN(x), recomputed from the raw module input x [M, Ca] with in_scale/in_offset.
 
-  add_input adds x, the module's residual update, from the tile already loaded.
+  add_input adds x, the module's residual update, from the tile already loaded. keep [M]: the rows that matter; a row
+  block with none (the bucket's padding) writes x unchanged with add_input, else zeros, without the work.
   """
   c, ca, o = x_cm.shape[0], x.shape[1], wo.shape[1]
   if not (epilogue_supported(c, ca, o) or stream_supported(c, ca, o)):
     return ref_trimul_epilogue_ln(x_cm, x, in_scale, in_offset, ln_scale, ln_offset, wo, bo, wg, bg, eps=eps,
                                   add_input=add_input).astype(x.dtype)
   return _epilogue(x_cm, x, [ln_scale, ln_offset, wo, bo, wg, bg, in_scale, in_offset], [], x.dtype, eps=eps,
-                   block_m=block_m, num_warps=num_warps, num_stages=num_stages, input_ln=True, add_input=add_input)
+                   block_m=block_m, num_warps=num_warps, num_stages=num_stages, input_ln=True, add_input=add_input,
+                   keep=keep)
 
 
-def ref_trimul_epilogue_ln(x_cm, x, in_scale, in_offset, ln_scale, ln_offset, wo, bo, wg, bg, *, eps=1e-5,
+def ref_trimul_epilogue_ln(x_cm, x, in_scale, in_offset, ln_scale, ln_offset, wo, bo, wg, bg, keep=None, *, eps=1e-5,
                            add_input=False):
   act = ref_ln(x.astype(jnp.float32), in_scale, in_offset, eps)
   return ref_trimul_epilogue(x_cm, act, ln_scale, ln_offset, wo, bo, wg, bg, x if add_input else None, eps=eps)
