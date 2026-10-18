@@ -78,13 +78,18 @@ def _chunks(d):
 
 
 def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, *rest,
-            sm_scale, block_q, block_k, sq, d, chunks, gated=False, fp8=False, prefix=False, half=False, group=1):
+            sm_scale, block_q, block_k, sq, d, chunks, gated=False, fp8=False, prefix=False, half=False, group=1,
+            trim=False):
   # gated: a gate [block_q, W] and its bias [W] come first, the output is o * sigmoid(gate + bias)
   # fp8: k and v come in e4m3 (fp8_supported), q is cast here, both dots accumulate in fp32
   # prefix: the row's count of leading key blocks with no masked key comes first; those skip the key mask
   # half (CUDA): the scores in f16, the bias (log2 domain, f16) the q.k^T accumulator, packed f16 max, subtract and
   # exp2; the row sum p.1 on the tensor cores
+  # trim: after the prefix, the row's count of key blocks up to its last unmasked key, and the token count past which
+  # every query is padding; blocks past the first are skipped, a row with no key or a query block past the second
+  # writes zeros (a padded row, which averaged its masked keys before)
   pre_ref, *rest = rest if prefix else (None, *rest)
+  end_ref, lim_ref, *rest = rest if trim else (None, None, *rest)
   g_ref, gb_ref, *rest = rest if gated else (None, None, *rest)
   o_ref, lse_ref = rest[0], rest[1] if len(rest) > 1 else None
   # q_ref [block_q, W]; k_ref/v_ref [Sk, W]; bias_ref [block_q, Sk]; kmask_ref [Sk],
@@ -176,13 +181,20 @@ def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, *rest,
     return o_next, m_next, l_next
 
   carry = (os, m_i, l_i)
+  whole = sk // block_k
+  if trim:
+    end = jnp.where(pl.program_id(0) // group * block_q < lim_ref[0], end_ref[0], 0)
+    whole = jnp.minimum(end, whole)
   if prefix:
-    full = jnp.minimum(pre_ref[0], sk // block_k)
+    full = jnp.minimum(pre_ref[0], whole)
     carry = jax.lax.fori_loop(0, full, functools.partial(body, masked=False), carry)
-    carry = jax.lax.fori_loop(full, sk // block_k, body, carry)
+    carry = jax.lax.fori_loop(full, whole, body, carry)
   else:
-    carry = jax.lax.fori_loop(0, sk // block_k, body, carry)
-  if sk % block_k:
+    carry = jax.lax.fori_loop(0, whole, body, carry)
+  if sk % block_k and trim:
+    # the tail block when the row's keys reach it: a loop of zero or one step
+    carry = jax.lax.fori_loop(sk // block_k, end, functools.partial(body, tail=True), carry)
+  elif sk % block_k:
     carry = body(sk // block_k, carry, tail=True)
   os, m_i, l_i = carry
   if half:
@@ -193,6 +205,9 @@ def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, *rest,
   if lse_ref is not None:
     # log2 domain, which is what the backward's exp2 wants
     plgpu.store(lse_ref, m_i + jnp.log2(l_i), mask=q_valid)
+  if trim:
+    # no key ran: zeros, not 0 / 0
+    l_i = jnp.where(l_i > 0, l_i, jnp.inf)
   for oc, (off, w), c in zip(os, chunks, cols):
     m = q_valid[:, None] if c is None else q_valid[:, None] & c[None, :]
     o = oc / l_i[:, None]

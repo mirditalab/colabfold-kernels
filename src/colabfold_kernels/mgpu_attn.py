@@ -42,13 +42,14 @@ def _tiles(cols, itemsize):
   return plgpu.TilingTransform((8, w)), plgpu.SwizzleTransform(w * itemsize)
 
 
-@functools.partial(jax.jit, static_argnames=("sm_scale", "column", "C", "block_q", "block_k", "stages", "group"))
+@functools.partial(jax.jit, static_argnames=("sm_scale", "column", "C", "block_q", "block_k", "stages", "group", "trim"))
 def packed_attention(p, bias, kmask, gate_bias=None, qk8=None, *, sm_scale, column=False, C=None, block_q=128,
-                     block_k=32, stages=None, group=None):
+                     block_k=32, stages=None, group=None, trim=False):
   """p [X, Y, G, H, D], bias [H, S, S], kmask [batch, S], gate_bias [H, D] iff G == 4; rows attend along Y.
 
   qk8 [X, Y, 2, H, D] holds q, already scaled by sm_scale * log2(e), and k in e4m3; p keeps v and the gate.
   group batch groups run each query block back to back, so they read its bias tile from L2 once.
+  trim: packed_attn.packed_attention's; a batch group runs the key blocks its longest row needs.
   """
   X, Y, G, H, D = p.shape
   fp8 = qk8 is not None
@@ -80,11 +81,19 @@ def packed_attention(p, bias, kmask, gate_bias=None, qk8=None, *, sm_scale, colu
   QK_LHS, QK_RHS = L.MMA_LHS(qkt), L.MMA_RHS(qkt)
   # 65536 registers: the memory warpgroup keeps 24 per thread, compute warpgroups split the rest
   regs = min(240, (65536 // 128 - 24) // C // 8 * 8)
+  if trim:
+    from colabfold_kernels.packed_attn import trim_limits
+    ends, lim = trim_limits(kmask, bk)
+    # a batch group's key blocks, its longest row's, then the query limit, then each row's own
+    ends = jnp.pad(ends, (0, nbg * C - nb))
+    lims = jnp.concatenate([ends.reshape(nbg, C).max(axis=1), lim, ends])
+  else:
+    lims = jnp.full((nbg + 1,), nk, jnp.int32).at[nbg].set(s)
 
   def rows_of(ref, b, *idx):  # the [s, ...] sequence of batch b
     return ref.at[(slice(None), b, *idx) if column else (b, slice(None), *idx)]
 
-  def kernel(p_ref, bias_ref, kadd_ref, gb_ref, qk_ref, o_ref, buf, *scratch):
+  def kernel(p_ref, bias_ref, kadd_ref, gb_ref, qk_ref, lims_ref, o_ref, buf, *scratch):
     # an e4m3 q has a buffer of its own; a bf16 one shares the gate's and output's
     q_smem, scratch = (scratch[0], scratch[1:]) if fp8 else (buf, scratch)
     b_smem, k_smem, v_smem, ka_smem, gb_smem, q_bar, g_bar, produced, consumed = scratch
@@ -95,6 +104,9 @@ def packed_attention(p, bias, kmask, gate_bias=None, qk8=None, *, sm_scale, colu
     bg = lax.div(sh, H) * group + lax.rem(qg, group)
     b0 = bg * C
     qrows = pl.ds(i * bq, bq)
+
+    def key_blocks():  # this CTA's key blocks: none past the query limit
+      return jnp.where(i * bq < lims_ref[nbg], lims_ref[bg], 0) if trim else nk
 
     # a supergroup past the batch groups has nothing to do
     @pl.when((wg < C) & (bg < nbg))
@@ -133,7 +145,11 @@ def packed_attention(p, bias, kmask, gate_bias=None, qk8=None, *, sm_scale, colu
       o0 = plgpu.layout_cast(jnp.zeros((bq, D), jnp.float32), ACC)
       m0 = plgpu.layout_cast(jnp.full((bq,), -jnp.inf, jnp.float32), ACC.reduce(1))
       l0 = plgpu.layout_cast(jnp.zeros((bq,), jnp.float32), ACC.reduce(1))
-      o, _, l = lax.fori_loop(0, nk, step, (o0, m0, l0))
+      o, _, l = lax.fori_loop(0, key_blocks(), step, (o0, m0, l0))
+      if trim:
+        # no key ran, or none of this row's (a padded row in a group that has keys): zeros, not 0 / 0 or an average
+        l = jnp.where(l > 0, l, jnp.inf)
+        o = o * jnp.where(lims_ref[nbg + 1 + b0 + wg] > 0, 1.0, 0.0)
       o = o / lax.broadcast_in_dim(l, o.shape, [0])
       if gated:
         plgpu.barrier_wait(g_bar.at[wg])
@@ -168,9 +184,10 @@ def packed_attention(p, bias, kmask, gate_bias=None, qk8=None, *, sm_scale, colu
         @pl.when(warp == 0)
         def _issue():
           # traced key offsets: a tail tile past s is TMA zero fill, not a static bounds error
-          pl.loop(0, min(stages, nk))(fetch)
+          n = key_blocks()
+          pl.loop(0, jnp.minimum(stages, n) if trim else min(stages, nk))(fetch)
 
-          @pl.loop(stages, max(nk, stages))
+          @pl.loop(stages, jnp.maximum(n, stages) if trim else max(nk, stages))
           def _(j):
             plgpu.barrier_wait(consumed.at[lax.rem(j, stages)])
             fetch(j)
@@ -196,4 +213,4 @@ def packed_attention(p, bias, kmask, gate_bias=None, qk8=None, *, sm_scale, colu
       entry, out_type=jax.ShapeDtypeStruct((X, Y, H, D), dt), grid=(nsg * H, nq * group), grid_names=("sh", "qg"),
       num_threads=C + 1, thread_name="wg",
       compiler_params=plgpu.CompilerParams(lowering_semantics=plgpu.LoweringSemantics.Lane, approx_math=True),
-  )(p, bias, kadd, gb, p if qk8 is None else qk8)
+  )(p, bias, kadd, gb, p if qk8 is None else qk8, lims)

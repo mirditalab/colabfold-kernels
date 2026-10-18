@@ -23,15 +23,17 @@ _dot = functools.partial(jnp.dot, preferred_element_type=jnp.float32)
 
 
 @functools.partial(jax.jit, static_argnames=(
-    "sm_scale", "column", "block_q", "block_k", "num_warps", "num_stages", "half", "out_dtype", "group"))
+    "sm_scale", "column", "block_q", "block_k", "num_warps", "num_stages", "half", "out_dtype", "group", "trim"))
 def packed_attention(p, bias, kmask, gate_bias=None, kv=None, *, sm_scale, column=False, block_q=None,
-                     block_k=None, num_warps=4, num_stages=None, half=None, out_dtype=None, group=None):
+                     block_k=None, num_warps=4, num_stages=None, half=None, out_dtype=None, group=None, trim=False):
   """p [X, Y, G, H, D] (G = 3, or 4 with a gate); bias [H, Sq, Sk]; kmask [batch, Sk] bool;
   gate_bias [H, D] when G == 4. Rows: batch X, sequence Y; column: batch Y, sequence X.
   kv [X, Y, 2, H, D], the k and v slots in e4m3, leaves p with q and the gate: both dots then run e4m3.
   half: the softmax in f16, by default when p is f16 on CUDA (a bf16 p's conversion in the kernel costs what it saves).
   The output is out_dtype, else p's. group: batches a q block runs adjacent (see the grid), 0 for none; by default 16
-  once the bias outgrows half the L2, else none."""
+  once the bias outgrows half the L2, else none.
+  trim: skip what padding costs (see trim_limits): a row's key blocks past its last unmasked key, and every query past
+  the last token any row lets through; those queries and rows with no unmasked key give zeros."""
   X, Y, G, H, D = p.shape
   half = (p.dtype == jnp.float16 and kv is None and not is_rocm()) if half is None else half
   assert not (half and kv is not None)
@@ -87,12 +89,16 @@ def packed_attention(p, bias, kmask, gate_bias=None, kv=None, *, sm_scale, colum
   lead = jnp.where(kmask.all(axis=1), s, jnp.argmin(kmask, axis=1))
   in_specs.append(pl.BlockSpec((1,), at(lambda i, h, j: (j,))))
   args.append((lead // block_k).astype(jnp.int32))
+  if trim:
+    ends, lim = trim_limits(kmask, block_k)
+    in_specs += [pl.BlockSpec((1,), at(lambda i, h, j: (j,))), pl.BlockSpec((1,), lambda *_: (0,))]
+    args += [ends, lim]
   if gated:
     in_specs += [q_spec(gs), pl.BlockSpec((None, dk), at(lambda i, h, j: (h, 0)))]
     args += [p, gate_bias]
   return pl.pallas_call(
       functools.partial(_kernel, sm_scale=sm_scale, block_q=block_q, block_k=block_k, sq=s, d=D,
-                        chunks=chunks, gated=gated, fp8=fp8, prefix=True, half=half, group=group or 1),
+                        chunks=chunks, gated=gated, fp8=fp8, prefix=True, half=half, group=group or 1, trim=trim),
       grid=grid,
       in_specs=in_specs,
       out_specs=o_spec,
@@ -102,12 +108,30 @@ def packed_attention(p, bias, kmask, gate_bias=None, kv=None, *, sm_scale, colum
   )(*args)
 
 
+def trim_limits(kmask, block_k):
+  """(ends [batch] int32, lim [1] int32): each batch row's key blocks up to and including its last unmasked key, and
+  the sequence position past which no row has an unmasked key. Queries share the keys' axis, so past lim they are
+  padding."""
+  s = kmask.shape[1]
+  last = jnp.where(kmask.any(axis=1), s - jnp.argmax(kmask[:, ::-1], axis=1), 0)
+  return (-(-last // block_k)).astype(jnp.int32), jnp.max(last, keepdims=True).astype(jnp.int32)
+
+
+def ref_trimmed(o, kmask, column=False):
+  """packed_attention's trim on a reference output o [X, Y, H, D]: zeros where trim gives them."""
+  _, lim = trim_limits(kmask, 1)
+  rows = kmask.any(axis=1)[:, None] & (jnp.arange(kmask.shape[1]) < lim)[None, :]  # [batch, sequence]
+  rows = rows.T if column else rows
+  return jnp.where(rows[:, :, None, None], o, 0)
+
+
 def unsplit_kv(p, kv):
   """The packed [X, Y, G, H, D] layout from p (q, then the gate) and the e4m3 k and v."""
   return jnp.concatenate([p[:, :, :1], kv.astype(p.dtype), p[:, :, 1:]], axis=2)
 
 
-def ref_packed_attention(p, bias, kmask, gate_bias=None, kv=None, *, sm_scale, column=False, out_dtype=None):
+def ref_packed_attention(p, bias, kmask, gate_bias=None, kv=None, *, sm_scale, column=False, out_dtype=None,
+                         trim=False):
   """float32 reference."""
   p = (p if kv is None else unsplit_kv(p, kv)).astype(jnp.float32)
   if column:
@@ -118,10 +142,12 @@ def ref_packed_attention(p, bias, kmask, gate_bias=None, kv=None, *, sm_scale, c
   o = jnp.einsum('bhqk,bkhd->bqhd', jax.nn.softmax(logits, axis=-1), v)
   if gate_bias is not None:
     o = o * jax.nn.sigmoid(p[:, :, 3] + gate_bias.astype(jnp.float32))
-  return jnp.swapaxes(o, 0, 1) if column else o
+  o = jnp.swapaxes(o, 0, 1) if column else o
+  return ref_trimmed(o, kmask, column) if trim else o
 
 
-def attention_via(p, bias, kmask, gate_bias=None, kv=None, *, sm_scale, column=False, attention, out_dtype=None):
+def attention_via(p, bias, kmask, gate_bias=None, kv=None, *, sm_scale, column=False, attention, out_dtype=None,
+                  trim=False):
   """packed_attention through a differentiable heads-major attention(q, k, v, mask_bias, bias, scale):
   the backward's reference, so the backward runs that kernel's backward."""
   p = p if kv is None else unsplit_kv(p, kv)
@@ -132,7 +158,8 @@ def attention_via(p, bias, kmask, gate_bias=None, kv=None, *, sm_scale, column=F
   if gate_bias is not None:
     o = (o.astype(jnp.float32) * jax.nn.sigmoid(pp[:, :, 3].astype(jnp.float32)
                                                + gate_bias.astype(jnp.float32))).astype(p.dtype)
-  return jnp.swapaxes(o, 0, 1) if column else o
+  o = jnp.swapaxes(o, 0, 1) if column else o
+  return ref_trimmed(o, kmask, column) if trim else o
 
 
 def projection_supported(*widths):

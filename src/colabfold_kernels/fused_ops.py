@@ -98,12 +98,13 @@ def _mgpu_attn():
     return None
 
 
-def _mosaic_or_triton(p, bias, kmask, gate_bias=None, p8=None, *, sm_scale, column=False, out_dtype=None):
+def _mosaic_or_triton(p, bias, kmask, gate_bias=None, p8=None, *, sm_scale, column=False, out_dtype=None, trim=False):
   """The Mosaic GPU kernel where it runs, else Triton's. p8 holds the e4m3 slots fp8_attention chose for that kernel."""
   from colabfold_kernels import packed_attn as pa
   if _mosaic_runs(p.shape[-1], p.dtype, p.shape[0 if column else 1]):
-    return _mgpu_attn().packed_attention(p, bias, kmask, gate_bias, p8, sm_scale=sm_scale, column=column)
-  return pa.packed_attention(p, bias, kmask, gate_bias, p8, sm_scale=sm_scale, column=column, out_dtype=out_dtype)
+    return _mgpu_attn().packed_attention(p, bias, kmask, gate_bias, p8, sm_scale=sm_scale, column=column, trim=trim)
+  return pa.packed_attention(p, bias, kmask, gate_bias, p8, sm_scale=sm_scale, column=column, out_dtype=out_dtype,
+                             trim=trim)
 
 
 def half_attention(global_config):
@@ -116,7 +117,11 @@ def half_attention(global_config):
 
 
 def packed_attention(global_config, dtype, key_dim, value_dim):
-  """-> f(p, bias, kmask, gate_bias, *, sm_scale, column) or None; p is the packed [X, Y, G, H, D] projection."""
+  """-> f(p, bias, kmask, gate_bias, *, sm_scale, column) or None; p is the packed [X, Y, G, H, D] projection.
+
+  global_config.trim_padding: skip the key blocks, query blocks and rows padding costs (packed_attention's trim); the
+  padded rows then hold zeros, so only for a caller whose padding is masked everywhere downstream (AF3's pairformer).
+  """
   import jax.numpy as jnp
   from colabfold_kernels.grads import differentiable_via
   from colabfold_kernels import packed_attn as pa
@@ -135,8 +140,8 @@ def packed_attention(global_config, dtype, key_dim, value_dim):
     return None
   fwd = _mosaic_or_triton if global_config.get('mosaic_gpu', True) else pa.packed_attention
   # a half-softmax p comes in f16; the output stays in the model's dtype
-  call = differentiable_via(fwd, ref, nondiff=('sm_scale', 'column', 'out_dtype'))
-  return functools.partial(call, out_dtype=dtype)
+  call = differentiable_via(fwd, ref, nondiff=('sm_scale', 'column', 'out_dtype', 'trim'))
+  return functools.partial(call, out_dtype=dtype, trim=global_config.get('trim_padding', False))
 
 
 def transition(global_config, dtype, num_channel, num_intermediate):

@@ -73,27 +73,37 @@ def _ln_gdp_kernel(x_ref, s_ref, offset_ref, wpl_ref, bpl_ref, wgl_ref, bgl_ref,
   # _gdp_kernel_split_cm on LN(x), so the normed pair never leaves the SM; rows past m are masked, not padded
   # m_out: rows written, past m zeros (their mask reads 0), the padding an FP8 GEMM's 16-byte rows want
   # chunk: the output columns stream in chunks, for widths whose whole weights do not fit
+  # a block whose mask is all zero (padding) writes the zeros it would compute, without reading x or the weights
   row = pl.program_id(row_axis) * block_m + jnp.arange(block_m)
   rows, out_rows = row < m, row < (m_out or m)
-  x = plgpu.load(x_ref, mask=rows[:, None], other=0.0).astype(jnp.float32)
-  x = ln_rows(x, s_ref, offset_ref, eps).astype(x_ref.dtype)
   mask = plgpu.load(mask_ref, mask=rows, other=0)
   cast = e4m3 if fp8 else (lambda t: t.astype(ol_ref.dtype))
   halves = ((wpl_ref, bpl_ref, wgl_ref, bgl_ref, ol_ref), (wpr_ref, bpr_ref, wgr_ref, bgr_ref, or_ref))
-  if chunk is None:
-    for w_p, b_p, w_g, b_g, o in halves:
-      plgpu.store(o, cast(_half(x, w_p[...], b_p[...], w_g[...], b_g[...], mask, activation).T),
-                  mask=out_rows[None, :])
-    return
+  live = jnp.max(jnp.abs(mask.astype(jnp.float32))) > 0
 
-  def body(j, carry):
-    js = pl.ds(pl.multiple_of(j * chunk, chunk), chunk)
-    for w_p, b_p, w_g, b_g, o in halves:
-      plgpu.store(o.at[js, :], cast(_half(x, w_p[:, js], b_p[js], w_g[:, js], b_g[js], mask, activation).T),
-                  mask=out_rows[None, :])
-    return carry
+  @pl.when(jnp.logical_not(live))
+  def _padding():
+    for *_, o in halves:
+      plgpu.store(o, cast(jnp.zeros(o.shape, jnp.float32)), mask=out_rows[None, :])
 
-  jax.lax.fori_loop(0, ol_ref.shape[0] // chunk, body, 0)
+  @pl.when(live)
+  def _rows():
+    x = plgpu.load(x_ref, mask=rows[:, None], other=0.0).astype(jnp.float32)
+    x = ln_rows(x, s_ref, offset_ref, eps).astype(x_ref.dtype)
+    if chunk is None:
+      for w_p, b_p, w_g, b_g, o in halves:
+        plgpu.store(o, cast(_half(x, w_p[...], b_p[...], w_g[...], b_g[...], mask, activation).T),
+                    mask=out_rows[None, :])
+      return
+
+    def body(j, carry):
+      js = pl.ds(pl.multiple_of(j * chunk, chunk), chunk)
+      for w_p, b_p, w_g, b_g, o in halves:
+        plgpu.store(o.at[js, :], cast(_half(x, w_p[:, js], b_p[js], w_g[:, js], b_g[js], mask, activation).T),
+                    mask=out_rows[None, :])
+      return carry
+
+    jax.lax.fori_loop(0, ol_ref.shape[0] // chunk, body, 0)
 
 
 def _gdp_kernel_split(x_ref, wpl_ref, bpl_ref, wgl_ref, bgl_ref,
