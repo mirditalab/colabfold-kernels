@@ -193,19 +193,33 @@ def packed_available(cc, head_dim):
     return head_dim in _native_dims(cc) and _load("attention", cc, (_attn_symbol(cc) + "Packed",))
 
 
-@functools.partial(jax.jit, static_argnames=("sm_scale", "column", "cc", "block_q", "block_k"))
+def packed_trim_available(cc):
+    """True if this device's attention library also takes trim limits (colabfold-legacy-kernels 0.6)."""
+    try:
+        return _load("attention", cc, (_attn_symbol(cc) + "PackedTrim",))
+    except AttributeError:
+        return False
+
+
+@functools.partial(jax.jit, static_argnames=("sm_scale", "column", "cc", "block_q", "block_k", "trim"))
 def volta_packed_attention(p, bias, kmask, gate_bias=None, *, sm_scale, column=False, cc,
-                           block_q=64, block_k=32):
-    """packed_attn.packed_attention for sm_70/75: p [X, Y, G, H, D] read in place, out [X, Y, H, D]."""
+                           block_q=64, block_k=32, trim=False):
+    """packed_attn.packed_attention for sm_70/75: p [X, Y, G, H, D] read in place, out [X, Y, H, D].
+
+    trim: packed_attn.packed_attention's, where the library has it (else every key and query run)."""
     X, Y, _, H, D = p.shape
     if cc >= 75 and D == 64 and (block_q, block_k) == (64, 32):
         block_k = 64    # the mma kernel has no (64, 64, 32) instantiation
     f16 = lambda t: t.astype(jnp.float16)
     gb = jnp.zeros((H, D), jnp.float16) if gate_bias is None else f16(gate_bias)
-    out = jax.ffi.ffi_call(_attn_symbol(cc) + "Packed",
+    lims = []
+    if trim and packed_trim_available(cc):
+        from colabfold_kernels.packed_attn import trim_limits
+        lims = [jnp.concatenate(trim_limits(kmask, 1))]
+    out = jax.ffi.ffi_call(_attn_symbol(cc) + ("PackedTrim" if lims else "Packed"),
                            jax.ShapeDtypeStruct((X, Y, H, D), jnp.float16),
                            vmap_method="sequential")(
-        f16(p), f16(bias), kmask.astype(jnp.uint8), gb, scale=np.float32(sm_scale),
+        f16(p), f16(bias), kmask.astype(jnp.uint8), gb, *lims, scale=np.float32(sm_scale),
         block_q=np.int64(block_q), block_k=np.int64(block_k), column=column)
     return out.astype(p.dtype)
 

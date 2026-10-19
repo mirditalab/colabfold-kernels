@@ -134,8 +134,9 @@ def packed_attention(global_config, dtype, key_dim, value_dim):
     va = _volta()
     if not va.packed_available(cc, key_dim):
       return None
-    return differentiable_via(functools.partial(va.volta_packed_attention, cc=cc), ref,
-                              nondiff=('sm_scale', 'column'))
+    call = differentiable_via(functools.partial(va.volta_packed_attention, cc=cc), ref,
+                              nondiff=('sm_scale', 'column', 'trim'))
+    return functools.partial(call, trim=global_config.get('trim_padding', False))
   if not _pallas_half(global_config, dtype):
     return None
   fwd = _mosaic_or_triton if global_config.get('mosaic_gpu', True) else pa.packed_attention

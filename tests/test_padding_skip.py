@@ -127,5 +127,19 @@ for X, Y, live in [(508, 200, 1), (508, 200, 37), (64, 130, 64)]:
       b = fn(p, bias, km, gb, sm_scale=d ** -0.5, column=column)
       check_keep(f"MSA {'column' if column else 'row'} attention {name} X={X} Y={Y} live={live}", [a], [b],
                  (jnp.arange(X) < live).astype(dt), [jnp.zeros(())])
+# the same on the sm_70/75 kernels, where this card has a colabfold-legacy-kernels build with trim
+from colabfold_kernels import volta as va
+cc = compute_capability()
+if cc is not None and va.packed_available(cc, 32) and va.packed_trim_available(cc):
+  for X, Y, live in [(508, 200, 1), (508, 200, 37), (64, 130, 64)]:
+    mrow = jnp.broadcast_to((jnp.arange(X) < live)[:, None], (X, Y))
+    p, gb = f(X, Y, 4, 8, 32).astype(jnp.float16), f(8, 32, s=.1)
+    for column in (False, True):
+      s = X if column else Y
+      km, bias = (mrow.T if column else mrow), f(8, s, s, s=.1)
+      a = va.volta_packed_attention(p, bias, km, gb, sm_scale=32 ** -0.5, column=column, cc=cc, trim=True)
+      b = va.volta_packed_attention(p, bias, km, gb, sm_scale=32 ** -0.5, column=column, cc=cc)
+      check_keep(f"legacy MSA {'column' if column else 'row'} attention X={X} Y={Y} live={live}", [a], [b],
+                 (jnp.arange(X) < live).astype(dt), [jnp.zeros(())])
 print("PASS 0" if not fails else f"FAIL {len(fails)}")
 sys.exit(bool(fails))
