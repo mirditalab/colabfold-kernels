@@ -76,7 +76,8 @@ def _ln_gdp_kernel(x_ref, s_ref, offset_ref, wpl_ref, bpl_ref, wgl_ref, bgl_ref,
   # a block whose mask is all zero (padding) writes the zeros it would compute, without reading x or the weights
   row = pl.program_id(row_axis) * block_m + jnp.arange(block_m)
   rows, out_rows = row < m, row < (m_out or m)
-  mask = plgpu.load(mask_ref, mask=rows, other=0)
+  # below zero: outside what the contraction reads, not written; inside a computed block it masks like zero
+  mask = jnp.maximum(plgpu.load(mask_ref, mask=rows, other=0), 0)
   cast = e4m3 if fp8 else (lambda t: t.astype(ol_ref.dtype))
   halves = ((wpl_ref, bpl_ref, wgl_ref, bgl_ref, ol_ref), (wpr_ref, bpr_ref, wgr_ref, bgr_ref, or_ref))
 
@@ -102,7 +103,8 @@ def _ln_gdp_kernel(x_ref, s_ref, offset_ref, wpl_ref, bpl_ref, wgl_ref, bgl_ref,
 
     jax.lax.fori_loop(0, ol_ref.shape[0] // chunk, body, 0)
 
-  unless_padding(mask_ref, rows, compute, padding)
+  # the rows past m up to m_out are the FP8 GEMM's zero padding: written
+  unless_padding(mask_ref, rows, compute, padding, other=0)
 
 
 def _gdp_kernel_split(x_ref, wpl_ref, bpl_ref, wgl_ref, bgl_ref,
@@ -313,10 +315,9 @@ def _epilogue_kernel(x_ref, a_ref, s_ref, o_ref_ln, wo_ref, bo_ref, wg_ref, bg_r
   compute = (functools.partial(_epilogue_rows, *refs, input_ln, add_input) if chunk is None
              else functools.partial(_epilogue_stream_rows, *refs, chunk, input_ln, add_input))
 
-  def padding():  # rows keep leaves out: the residual as it was (add_input's raw input, else residual), else zeros
-    src = a_ref if add_input else r_ref
-    out = plgpu.load(src, mask=rows[:, None], other=0.0) if src is not None else jnp.zeros(o_ref.shape, o_ref.dtype)
-    plgpu.store(o_ref, out.astype(o_ref.dtype), mask=rows[:, None])
+  def padding():  # rows keep leaves out: zeros, or the residual (add_input's raw input), which the aliased output holds
+    if not (add_input or r_ref is not None):
+      plgpu.store(o_ref, jnp.zeros(o_ref.shape, o_ref.dtype), mask=rows[:, None])
 
   unless_padding(keep_ref, rows, compute, padding)
 
@@ -413,6 +414,8 @@ def _epilogue(x_cm, act, params, extra, dtype, *, eps, block_m, num_warps, num_s
                + ([] if keep is None else [pl.BlockSpec((block_m,), lambda i: (i,))]),
       out_specs=rows,
       out_shape=jax.ShapeDtypeStruct((m, o), dtype),
+      # the output is the residual's buffer: add_input's raw input, else the residual
+      input_output_aliases={1: 0} if add_input else ({2 + len(params): 0} if extra else {}),
       compiler_params=plgpu.CompilerParams(num_warps=num_warps, num_stages=num_stages),
       name="trimul_epilogue",
   )(x_cm, act, *params, *extra, *([] if keep is None else [keep.reshape(m)]))

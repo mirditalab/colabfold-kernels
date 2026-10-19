@@ -225,7 +225,8 @@ def ln_projection(x, ln_scale, ln_offset, w=None, wb=None, keep=None, *, eps=1e-
   Returns (p, bias), None for an absent weight. f8_slots, slots of w written e4m3 to a third output
   [M, len(f8_slots)*n] in that order, leave p with the others; f8_scales, one a slot, scale them before rounding.
   p_dtype: p's dtype, else x's (f16 for packed_attention's half softmax).
-  keep [M]: the rows that matter; a row block with none (the bucket's padding) writes zeros without the work.
+  keep [M]: the rows that matter; a row block with none (the bucket's padding) writes zeros without the work, one below
+  zero everywhere nothing.
   """
   f8_scales = f8_scales or (1.0,) * len(f8_slots)
   m, a = x.shape
@@ -311,10 +312,9 @@ def _out_proj_kernel(o_ref, w_ref, b_ref, *rest, m, block_m, block_k, residual, 
       out = out + plgpu.load(r_ref, mask=rows[:, None], other=0.0).astype(jnp.float32)
     plgpu.store(out_ref, out.astype(out_ref.dtype), mask=rows[:, None])
 
-  def padding():  # rows keep leaves out: the residual as it was, else zeros
-    out = (plgpu.load(r_ref, mask=rows[:, None], other=0.0) if r_ref is not None
-           else jnp.zeros(out_ref.shape, out_ref.dtype))
-    plgpu.store(out_ref, out.astype(out_ref.dtype), mask=rows[:, None])
+  def padding():  # rows keep leaves out: zeros, or the residual, which the aliased output holds already
+    if r_ref is None:
+      plgpu.store(out_ref, jnp.zeros(out_ref.shape, out_ref.dtype), mask=rows[:, None])
 
   unless_padding(keep_ref, rows, compute, padding)
 
@@ -328,8 +328,8 @@ def output_projection_supported(k, c):
 def output_projection(o, w, b, residual=None, keep=None, *, block_m=64, num_warps=None, num_stages=2):
   """o [M, k] @ w [k, c] + b, plus residual [M, c] when given, in one pass.
 
-  The result has residual's dtype, else o's. keep [M]: the rows that matter; a row block with none (the bucket's
-  padding) writes the residual unchanged, else zeros, without the work.
+  The result has residual's dtype, else o's, and aliases the residual. keep [M]: the rows that matter; a row block
+  with none (the bucket's padding) leaves the residual unchanged, else writes zeros, without the work.
   """
   m, k = o.shape
   c = w.shape[1]
@@ -349,6 +349,7 @@ def output_projection(o, w, b, residual=None, keep=None, *, block_m=64, num_warp
                 pl.BlockSpec((c,), lambda i: (0,))] + specs,
       out_specs=rows,
       out_shape=jax.ShapeDtypeStruct((m, c), o.dtype if residual is None else residual.dtype),
+      input_output_aliases={} if residual is None else {3: 0},
       compiler_params=plgpu.CompilerParams(num_warps=num_warps, num_stages=num_stages),
       name="output_projection",
   )(o, w, b, *extra)

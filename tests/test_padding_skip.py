@@ -2,7 +2,8 @@
 ln_gated_dual_proj (flat, pair, transposed, e4m3 with 16-row padding, streamed past 128 channels): outputs on real rows
 match the float32 reference as before, padded ones are exactly zero, all finite. ln_projection, output_projection,
 trimul_epilogue_ln and fused_glu_transition with keep: real rows bit-identical to the call without keep, padded rows
-either that or what the skipped block writes (zeros, or the residual unchanged), all finite."""
+either that or what the skipped block writes (zeros, or the residual unchanged), all finite. A keep below zero past the
+live block: those blocks are not written, the rest as before."""
 import sys
 
 import jax
@@ -112,6 +113,37 @@ for S, n in [(256, 256), (256, 200), (256, 129), (192, 65)]:
     check_keep(f"fused_glu_transition add_input={add_input} S={S} n={n}",
                [tr.fused_glu_transition(x, sc, of, wa, wb2, wo2, keep, add_input=add_input)],
                [tr.fused_glu_transition(x, sc, of, wa, wb2, wo2, add_input=add_input)], keep, [x if add_input else zero])
+# keep below zero past the live block rounded up (what a trimmed attention or the live block's contraction reads):
+# ln_projection and ln_gated_dual_proj write nothing there; real rows as without keep, padding inside the block as
+# without keep or zeros
+for S, n in [(256, 200), (384, 129), (192, 65)]:
+  R = -(-n // 128) * 128
+  tok, ins = jnp.arange(S) < n, jnp.arange(S) < R
+  mask = (tok[:, None] & tok[None, :]).astype(dt)
+  region = jnp.where(ins[:, None] & ins[None, :], mask, -1).astype(dt)
+  inside = np.asarray(ins[:, None] & ins[None, :]).reshape(-1)
+  c = 128
+  x = f(S * S, c, s=2.)
+  sc, of, w, wb = f(c, s=.1) + 1, f(c, s=.1), f(4, c, 128, s=.1), f(c, 4, s=.1)
+  out = [np.asarray(t.astype(jnp.float32)) for t in pa.ln_projection(x, sc, of, w, wb, region.reshape(-1))]
+  base = [np.asarray(t.astype(jnp.float32)) for t in pa.ln_projection(x, sc, of, w, wb)]
+  live = np.asarray(mask).reshape(-1) > 0
+  ok = all(np.array_equal(o[live] if o.shape[0] == live.size else o[:, live],
+                          b[live] if b.shape[0] == live.size else b[:, live]) for o, b in zip(out, base))
+  pad = inside & ~live
+  rows = lambda t: t[pad] if t.shape[0] == live.size else t[:, pad]
+  ok &= all(np.all((rows(o) == rows(b)) | (rows(o) == 0)) for o, b in zip(out, base))
+  g = (f(c, s=.1) + 1, f(c, s=.1), f(c, 256, s=.1), f(256, s=.1), f(c, 256, s=.1), f(256, s=.1))
+  xp = x.reshape(S, S, c)
+  out = tm.ln_gated_dual_proj(xp, *g, region)
+  ref = tm.ref_ln_gdp(xp, *g, mask)
+  for o, r in zip(out, ref):
+    o, r = np.asarray(o.astype(jnp.float32))[:, :R, :R], np.asarray(r)[:, :R, :R]
+    ok &= bool(np.isfinite(o).all()) and float(np.abs(o - r).max() / (np.abs(r).max() + 1e-6)) < 0.02
+    ok &= float(np.abs(o[r == 0]).max(initial=0)) == 0
+  print(f"{'ok  ' if ok else 'BAD '}keep below zero S={S} n={n}: real rows as without, padding inside the block too or zeros")
+  if not ok:
+    fails.append(f"keep below zero S={S} n={n}")
 # an MSA padded to its full depth: live rows lead, padded rows trail (AF2 at a fixed depth). Attention over each row
 # and down each column with trim: live rows bit-identical to the call without trim, padded rows zeros
 from colabfold_kernels import fused_ops

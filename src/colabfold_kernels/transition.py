@@ -26,15 +26,16 @@ def ln_rows(x, scale_ref, offset_ref, eps):
   return y * scale_ref[...][None, :].astype(jnp.float32) + offset_ref[...][None, :].astype(jnp.float32)
 
 
-def unless_padding(keep_ref, rows, compute, padding):
-  """In a kernel: compute() for a row block with a row keep_ref marks, padding() for one with none (the bucket's
-  padding: its rows then skip the work and get what padding() stores). keep_ref None: always compute()."""
+def unless_padding(keep_ref, rows, compute, padding, other=-1):
+  """In a kernel: compute() for a row block with a row keep_ref marks (> 0), padding() for one of zeros (the bucket's
+  padding: its rows then skip the work and get what padding() stores), nothing for one below zero everywhere (outside
+  what any consumer reads: not even written). Rows past the array count as other. keep_ref None: always compute()."""
   if keep_ref is None:
     compute()
     return
-  live = jnp.max(jnp.abs(plgpu.load(keep_ref, mask=rows, other=0).astype(jnp.float32))) > 0
-  pl.when(live)(compute)
-  pl.when(jnp.logical_not(live))(padding)
+  top = jnp.max(plgpu.load(keep_ref, mask=rows, other=other).astype(jnp.float32))
+  pl.when(top > 0)(compute)
+  pl.when(top == 0)(padding)
 
 
 def sigmoid(x):
@@ -86,9 +87,9 @@ def _kernel(x_ref, s_ref, o_ref_ln, w1_ref, b1_ref, w2_ref, b2_ref, *refs, eps, 
       out = out + x
     plgpu.store(o_ref, out.astype(o_ref.dtype), mask=rows[:, None])
 
-  def padding():  # a block keep marks nowhere: the input as it was, else zeros
-    out = plgpu.load(x_ref, mask=rows[:, None], other=0.0) if add_input else jnp.zeros(o_ref.shape, o_ref.dtype)
-    plgpu.store(o_ref, out.astype(o_ref.dtype), mask=rows[:, None])
+  def padding():  # a block keep marks nowhere: zeros; with add_input the output is x's buffer, which holds x already
+    if not add_input:
+      plgpu.store(o_ref, jnp.zeros(o_ref.shape, o_ref.dtype), mask=rows[:, None])
 
   unless_padding(keep_ref, rows, compute, padding)
 
@@ -106,6 +107,7 @@ def fused_transition(x, ln_scale, ln_offset, w1, b1, w2, b2, keep=None, *, eps=1
 
   add_input returns x + transition(x), the residual update, from the tile already loaded.
   keep [...]: a row block it marks nowhere (padding) skips the transition; the rows it marks are computed as without it.
+  With add_input the output aliases x, so a skipped block writes nothing.
   """
   c = x.shape[-1]
   hdim = w1.shape[1]
@@ -128,6 +130,7 @@ def fused_transition(x, ln_scale, ln_offset, w1, b1, w2, b2, keep=None, *, eps=1
            + ([] if keep is None else [pl.BlockSpec((block_m,), lambda i: (i,))]),
       out_specs=pl.BlockSpec((block_m, c), lambda i: (i, 0)),
       out_shape=jax.ShapeDtypeStruct((m, c), x.dtype),
+      input_output_aliases={0: 0} if add_input else {},
       compiler_params=plgpu.CompilerParams(num_warps=num_warps, num_stages=num_stages),
       name="fused_transition",
   )(xf, ln_scale, ln_offset, w1, b1, w2, b2, *([] if keep is None else [keep.reshape(m)]))
@@ -160,14 +163,15 @@ def _glu_kernel(x_ref, s_ref, o_ref_ln, wa_ref, wb_ref, wo_ref, *refs, eps, m, b
     acc = jnp.zeros((block_m, wo_ref.shape[1]), jnp.float32)
     acc = jax.lax.fori_loop(0, wa_ref.shape[1] // chunk, body, acc)
     if keep_ref is not None:
-      acc = acc * plgpu.load(keep_ref, mask=rows, other=0.0).astype(jnp.float32)[:, None]
+      keep = plgpu.load(keep_ref, mask=rows, other=0.0).astype(jnp.float32)
+      acc = acc * jnp.maximum(keep, 0.0)[:, None]
     if add_input:
       acc = acc + x
     plgpu.store(o_ref, acc.astype(o_ref.dtype), mask=rows[:, None])
 
-  def padding():  # keep 0 on every row: what compute() gives them, without the transition
-    out = plgpu.load(x_ref, mask=rows[:, None], other=0.0) if add_input else jnp.zeros(o_ref.shape, o_ref.dtype)
-    plgpu.store(o_ref, out.astype(o_ref.dtype), mask=rows[:, None])
+  def padding():  # keep 0 on every row: what compute() gives them (with add_input x, already in the aliased output)
+    if not add_input:
+      plgpu.store(o_ref, jnp.zeros(o_ref.shape, o_ref.dtype), mask=rows[:, None])
 
   unless_padding(keep_ref, rows, compute, padding)
 
@@ -209,6 +213,7 @@ def fused_glu_transition(x, ln_scale, ln_offset, wa, wb, wo, keep=None, *, eps=1
            + ([] if keep is None else [pl.BlockSpec((block_m,), lambda i: (i,))]),
       out_specs=pl.BlockSpec((block_m, c), lambda i: (i, 0)),
       out_shape=jax.ShapeDtypeStruct((m, c), x.dtype),
+      input_output_aliases={0: 0} if add_input else {},
       compiler_params=plgpu.CompilerParams(num_warps=num_warps, num_stages=num_stages),
       name="fused_glu_transition",
   )(xf, ln_scale, ln_offset, wa.astype(x.dtype), wb.astype(x.dtype), wo.astype(x.dtype),
