@@ -88,11 +88,11 @@ def _mgpu_attn():
     import jax
     import jax.numpy as jnp
     from colabfold_kernels import mgpu_attn
-    # a Mosaic GPU API this kernel does not match fails only once lowered, so compile a small call here
+    # a Mosaic GPU API this kernel does not match fails only once lowered, so lower a small call here (not compiled: ptxas is 0.7 s)
     sds = jax.ShapeDtypeStruct
     jax.jit(functools.partial(mgpu_attn.packed_attention, sm_scale=1.0)).lower(
         sds((8, 64, 4, 2, 32), jnp.bfloat16), sds((2, 64, 64), jnp.bfloat16), sds((8, 64), jnp.bool_),
-        sds((2, 32), jnp.bfloat16)).compile()
+        sds((2, 32), jnp.bfloat16))
     return mgpu_attn
   except Exception:
     return None
