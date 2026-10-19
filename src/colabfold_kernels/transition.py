@@ -64,25 +64,33 @@ def ref_ln(xf, scale, offset, eps):
   return (xf - mean) * jax.lax.rsqrt(var + eps) * scale + offset
 
 
-def _kernel(x_ref, s_ref, o_ref_ln, w1_ref, b1_ref, w2_ref, b2_ref, o_ref, *, eps, m, block_m,
-            chunk, add_input):
+def _kernel(x_ref, s_ref, o_ref_ln, w1_ref, b1_ref, w2_ref, b2_ref, *refs, eps, m, block_m, chunk, add_input):
+  keep_ref, o_ref = refs if len(refs) == 2 else (None,) + refs
   rows = (pl.program_id(0) * block_m + jnp.arange(block_m)) < m
-  x = plgpu.load(x_ref, mask=rows[:, None], other=0.0).astype(jnp.float32)
-  y = ln_rows(x, s_ref, o_ref_ln, eps)
-  y = y.astype(w1_ref.dtype)
 
-  def body(k, acc):
-    ks = pl.ds(pl.multiple_of(k * chunk, chunk), chunk)
-    h = _dot(y, w1_ref[:, ks]) + b1_ref[ks][None, :].astype(jnp.float32)
-    h = jnp.maximum(h, 0.0).astype(w2_ref.dtype)
-    return acc + _dot(h, w2_ref[ks, :])
+  def compute():
+    x = plgpu.load(x_ref, mask=rows[:, None], other=0.0).astype(jnp.float32)
+    y = ln_rows(x, s_ref, o_ref_ln, eps)
+    y = y.astype(w1_ref.dtype)
 
-  acc = jnp.zeros((block_m, w2_ref.shape[1]), jnp.float32)
-  acc = jax.lax.fori_loop(0, w1_ref.shape[1] // chunk, body, acc)
-  out = acc + b2_ref[...][None, :].astype(jnp.float32)
-  if add_input:
-    out = out + x
-  plgpu.store(o_ref, out.astype(o_ref.dtype), mask=rows[:, None])
+    def body(k, acc):
+      ks = pl.ds(pl.multiple_of(k * chunk, chunk), chunk)
+      h = _dot(y, w1_ref[:, ks]) + b1_ref[ks][None, :].astype(jnp.float32)
+      h = jnp.maximum(h, 0.0).astype(w2_ref.dtype)
+      return acc + _dot(h, w2_ref[ks, :])
+
+    acc = jnp.zeros((block_m, w2_ref.shape[1]), jnp.float32)
+    acc = jax.lax.fori_loop(0, w1_ref.shape[1] // chunk, body, acc)
+    out = acc + b2_ref[...][None, :].astype(jnp.float32)
+    if add_input:
+      out = out + x
+    plgpu.store(o_ref, out.astype(o_ref.dtype), mask=rows[:, None])
+
+  def padding():  # a block keep marks nowhere: the input as it was, else zeros
+    out = plgpu.load(x_ref, mask=rows[:, None], other=0.0) if add_input else jnp.zeros(o_ref.shape, o_ref.dtype)
+    plgpu.store(o_ref, out.astype(o_ref.dtype), mask=rows[:, None])
+
+  unless_padding(keep_ref, rows, compute, padding)
 
 
 def supported(c, hdim):
@@ -92,11 +100,12 @@ def supported(c, hdim):
 
 @functools.partial(jax.jit, static_argnames=("eps", "add_input", "block_m", "chunk", "num_warps",
                                              "num_stages"))
-def fused_transition(x, ln_scale, ln_offset, w1, b1, w2, b2, *, eps=1e-5, add_input=False, block_m=None,
+def fused_transition(x, ln_scale, ln_offset, w1, b1, w2, b2, keep=None, *, eps=1e-5, add_input=False, block_m=None,
                      chunk=None, num_warps=None, num_stages=None):
   """x [..., C]; ln_scale/ln_offset [C]; w1 [C, H]; b1 [H]; w2 [H, C]; b2 [C]. Returns x's shape.
 
   add_input returns x + transition(x), the residual update, from the tile already loaded.
+  keep [...]: a row block it marks nowhere (padding) skips the transition; the rows it marks are computed as without it.
   """
   c = x.shape[-1]
   hdim = w1.shape[1]
@@ -115,16 +124,17 @@ def fused_transition(x, ln_scale, ln_offset, w1, b1, w2, b2, *, eps=1e-5, add_in
       grid=(pl.cdiv(m, block_m),),
       in_specs=[pl.BlockSpec((block_m, c), lambda i: (i, 0)), vec(c), vec(c),
                 pl.BlockSpec((c, hdim), lambda i: (0, 0)), vec(hdim),
-                pl.BlockSpec((hdim, c), lambda i: (0, 0)), vec(c)],
+                pl.BlockSpec((hdim, c), lambda i: (0, 0)), vec(c)]
+           + ([] if keep is None else [pl.BlockSpec((block_m,), lambda i: (i,))]),
       out_specs=pl.BlockSpec((block_m, c), lambda i: (i, 0)),
       out_shape=jax.ShapeDtypeStruct((m, c), x.dtype),
       compiler_params=plgpu.CompilerParams(num_warps=num_warps, num_stages=num_stages),
       name="fused_transition",
-  )(xf, ln_scale, ln_offset, w1, b1, w2, b2)
+  )(xf, ln_scale, ln_offset, w1, b1, w2, b2, *([] if keep is None else [keep.reshape(m)]))
   return out.reshape(x.shape)
 
 
-def ref_transition(x, ln_scale, ln_offset, w1, b1, w2, b2, *, eps=1e-5, add_input=False):
+def ref_transition(x, ln_scale, ln_offset, w1, b1, w2, b2, keep=None, *, eps=1e-5, add_input=False):
   """float32 reference."""
   xf = x.astype(jnp.float32)
   y = ref_ln(xf, ln_scale, ln_offset, eps)

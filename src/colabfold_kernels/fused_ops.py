@@ -145,7 +145,7 @@ def packed_attention(global_config, dtype, key_dim, value_dim):
 
 
 def transition(global_config, dtype, num_channel, num_intermediate):
-  """-> f(x, ln_scale, ln_offset, w1, b1, w2, b2, *, eps) or None: the whole LN-MLP transition."""
+  """-> f(x, ln_scale, ln_offset, w1, b1, w2, b2, keep=None, *, eps) or None: the whole LN-MLP transition."""
   if not _pallas_half(global_config, dtype):
     return None
   from colabfold_kernels import transition as t

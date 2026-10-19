@@ -103,9 +103,29 @@ for S, n in [(256, 256), (256, 200), (256, 129), (192, 65)]:
                  [tm.trimul_epilogue_ln(tri, x, *g, keep, add_input=add_input)],
                  [tm.trimul_epilogue_ln(tri, x, *g, add_input=add_input)], keep, [x if add_input else zero])
   wa, wb2, wo2 = f(c, 4 * c, s=.1), f(c, 4 * c, s=.1), f(4 * c, c, s=.1)
+  w1, b1, w2, b2 = f(c, 4 * c, s=.1), f(4 * c, s=.1), f(4 * c, c, s=.1), f(c, s=.1)
+  for add_input in (False, True):
+    check_keep(f"fused_transition add_input={add_input} S={S} n={n}",
+               [tr.fused_transition(x, sc, of, w1, b1, w2, b2, keep, add_input=add_input)],
+               [tr.fused_transition(x, sc, of, w1, b1, w2, b2, add_input=add_input)], keep, [x if add_input else zero])
   for add_input in (False, True):
     check_keep(f"fused_glu_transition add_input={add_input} S={S} n={n}",
                [tr.fused_glu_transition(x, sc, of, wa, wb2, wo2, keep, add_input=add_input)],
                [tr.fused_glu_transition(x, sc, of, wa, wb2, wo2, add_input=add_input)], keep, [x if add_input else zero])
+# an MSA padded to its full depth: live rows lead, padded rows trail (AF2 at a fixed depth). Attention over each row
+# and down each column with trim: live rows bit-identical to the call without trim, padded rows zeros
+from colabfold_kernels import fused_ops
+for X, Y, live in [(508, 200, 1), (508, 200, 37), (64, 130, 64)]:
+  h, d = 8, 32
+  mrow = jnp.broadcast_to((jnp.arange(X) < live)[:, None], (X, Y))
+  p, gb = f(X, Y, 4, h, d), f(h, d, s=.1)
+  for column in (False, True):
+    s = X if column else Y
+    km, bias = (mrow.T if column else mrow), f(h, s, s, s=.1)
+    for name, fn in (("triton", pa.packed_attention), ("dispatch", fused_ops._mosaic_or_triton)):
+      a = fn(p, bias, km, gb, sm_scale=d ** -0.5, column=column, trim=True)
+      b = fn(p, bias, km, gb, sm_scale=d ** -0.5, column=column)
+      check_keep(f"MSA {'column' if column else 'row'} attention {name} X={X} Y={Y} live={live}", [a], [b],
+                 (jnp.arange(X) < live).astype(dt), [jnp.zeros(())])
 print("PASS 0" if not fails else f"FAIL {len(fails)}")
 sys.exit(bool(fails))
