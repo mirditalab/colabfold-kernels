@@ -169,9 +169,9 @@ def _glu_kernel(x_ref, s_ref, o_ref_ln, wa_ref, wb_ref, wo_ref, *refs, eps, m, b
       acc = acc + x
     plgpu.store(o_ref, acc.astype(o_ref.dtype), mask=rows[:, None])
 
-  def padding():  # keep 0 on every row: what compute() gives them (with add_input x, already in the aliased output)
-    if not add_input:
-      plgpu.store(o_ref, jnp.zeros(o_ref.shape, o_ref.dtype), mask=rows[:, None])
+  def padding():  # keep 0 on every row: what compute() gives them, without the transition
+    out = plgpu.load(x_ref, mask=rows[:, None], other=0.0) if add_input else jnp.zeros(o_ref.shape, o_ref.dtype)
+    plgpu.store(o_ref, out.astype(o_ref.dtype), mask=rows[:, None])
 
   unless_padding(keep_ref, rows, compute, padding)
 
@@ -187,7 +187,8 @@ def fused_glu_transition(x, ln_scale, ln_offset, wa, wb, wo, keep=None, *, eps=1
   """AF3's transition: LN(x) -> activation(. @ wa) * (. @ wb) -> @ wo, no biases; x [..., C], wa/wb [C, H], wo [H, C].
 
   keep [...] scales each output row (OpenFold3's output mask); add_input returns x + that from the tile already loaded.
-  A row block keep zeroes entirely skips the transition (the bucket's padding).
+  A row block keep zeroes entirely skips the transition (the bucket's padding). The output does not alias x: aliased,
+  Triton compiled the 512-channel kernel 9x slower (226 vs 25 ms at 262,144 rows), even with no block skipped.
   """
   c, hdim = x.shape[-1], wa.shape[1]
   assert glu_supported(c, hdim), (c, hdim)
@@ -213,7 +214,6 @@ def fused_glu_transition(x, ln_scale, ln_offset, wa, wb, wo, keep=None, *, eps=1
            + ([] if keep is None else [pl.BlockSpec((block_m,), lambda i: (i,))]),
       out_specs=pl.BlockSpec((block_m, c), lambda i: (i, 0)),
       out_shape=jax.ShapeDtypeStruct((m, c), x.dtype),
-      input_output_aliases={0: 0} if add_input else {},
       compiler_params=plgpu.CompilerParams(num_warps=num_warps, num_stages=num_stages),
       name="fused_glu_transition",
   )(xf, ln_scale, ln_offset, wa.astype(x.dtype), wb.astype(x.dtype), wo.astype(x.dtype),
