@@ -8,7 +8,7 @@ from colabfold_kernels import diffusion
 
 def cfg(tail, steps=200, max_sigma=0.0):
   return types.SimpleNamespace(steps=steps, sigma_max=160.0, sigma_min=4e-4, rho=7.0, schedule_tail=tail,
-                               max_sigma=max_sigma, flow=False)
+                               max_sigma=max_sigma)
 
 ok = True
 base = diffusion.schedule(cfg(""), "openfold3")

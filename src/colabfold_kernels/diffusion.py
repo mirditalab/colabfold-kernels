@@ -179,8 +179,7 @@ def schedule(cfg, model):
         times = np.linspace(0, 1, cfg.steps, dtype=np.float32)
     else:
         times = np.linspace(0, 1, cfg.steps + 1, dtype=np.float32)
-    flow = getattr(cfg, "flow", False)
-    smax, smin, rho = (cfg.flow_sigma_max if flow else cfg.sigma_max), cfg.sigma_min, cfg.rho
+    smax, smin, rho = cfg.sigma_max, cfg.sigma_min, cfg.rho
     sig = np.asarray(16.0 * (smax ** (1 / rho) + times * (smin ** (1 / rho) - smax ** (1 / rho))) ** rho, np.float32)
     if tail in ("append", "extend"):
         sig = np.concatenate([sig, np.zeros((1,), np.float32)])
@@ -188,7 +187,7 @@ def schedule(cfg, model):
         sig[-1] = 0.0
     elif tail:
         raise ValueError(f"schedule_tail {tail!r}: want append, replace or extend")
-    if getattr(cfg, "max_sigma", 0.0) and not flow:
+    if getattr(cfg, "max_sigma", 0.0):
         sig = np.concatenate([[cfg.max_sigma], sig[sig <= cfg.max_sigma]]).astype(np.float32)
     return sig
 
