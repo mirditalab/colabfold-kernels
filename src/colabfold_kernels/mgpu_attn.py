@@ -145,7 +145,18 @@ def packed_attention(p, bias, kmask, gate_bias=None, qk8=None, *, sm_scale, colu
       o0 = plgpu.layout_cast(jnp.zeros((bq, D), jnp.float32), ACC)
       m0 = plgpu.layout_cast(jnp.full((bq,), -jnp.inf, jnp.float32), ACC.reduce(1))
       l0 = plgpu.layout_cast(jnp.zeros((bq,), jnp.float32), ACC.reduce(1))
-      o, _, l = lax.fori_loop(0, key_blocks(), step, (o0, m0, l0))
+      if trim:
+        # a group no padding trims runs the static loop, the others the traced bound two steps at a time: a plain
+        # traced loop cost 11% at no padding, this pair of loops nothing
+        n = key_blocks()
+
+        def trimmed():
+          carry = lax.fori_loop(0, n // 2, lambda j, c: step(2 * j + 1, step(2 * j, c)), (o0, m0, l0))
+          return lax.cond(n % 2 == 1, lambda: step(n - 1, carry), lambda: carry)
+
+        o, _, l = lax.cond(n == nk, lambda: lax.fori_loop(0, nk, step, (o0, m0, l0)), trimmed)
+      else:
+        o, _, l = lax.fori_loop(0, nk, step, (o0, m0, l0))
       if trim:
         # no key ran, or none of this row's (a padded row in a group that has keys): zeros, not 0 / 0 or an average
         l = jnp.where(l > 0, l, jnp.inf)
