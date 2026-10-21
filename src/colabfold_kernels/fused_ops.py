@@ -255,6 +255,17 @@ def opm_update(global_config, dtype, num_inner, num_output):
   return differentiable_via(opm.opm_update, opm.ref_opm_update, nondiff=('eps',))
 
 
+def opm_outer(global_config, dtype, rows, num_inner, d, num_output):
+  """-> f(left, right, w) or None: the outer product mean in AF2's own order on 16 rows, its product never written."""
+  if not _pallas_half(global_config, dtype):
+    return None
+  from colabfold_kernels.grads import differentiable_via
+  from colabfold_kernels import opm
+  if not opm.outer_supported(rows, num_inner, d, num_output):
+    return None
+  return differentiable_via(opm.opm_outer, opm.ref_opm_outer)
+
+
 def layer_norm(global_config, dtype):
   """-> f(x, scale, offset, *, eps) or None. Last-axis, scale+offset only."""
   import jax.numpy as jnp
