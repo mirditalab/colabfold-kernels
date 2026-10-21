@@ -13,6 +13,42 @@ from colabfold_kernels.tri_flash import LOG2E, NEG
 L = plgpu.Layout
 
 
+class _CtaOnlyNvvm:
+  """Mosaic's nvvm with its TMA loads that multicast to no one in the .shared::cta form: on sm_120 the .shared::cluster
+  form is a driver syscall, which drops setmaxnreg and reserves its 14.6 KB stack for every resident thread (4.2 GB)"""
+
+  def __init__(self, nvvm):
+    self._nvvm = nvvm
+
+  def __getattr__(self, name):
+    return getattr(self._nvvm, name)
+
+  def cp_async_bulk_tensor_shared_cluster_global(self, dst, desc, coords, mbar, im2col, *, multicast_mask=None,
+                                                 predicate=None, **kwargs):
+    if multicast_mask is not None or im2col or any(v is not None for v in kwargs.values()):
+      return self._nvvm.cp_async_bulk_tensor_shared_cluster_global(
+          dst, desc, coords, mbar, im2col, multicast_mask=multicast_mask, predicate=predicate, **kwargs)
+    if predicate is None:
+      return self._nvvm.cp_async_bulk_tensor_shared_cluster_global(dst, desc, coords, mbar, im2col, is_cta_only=True)
+    # the op takes a predicate in its cluster form only
+    from jax._src.lib.mlir import ir
+    from jax._src.lib.mlir.dialects import llvm
+    idx = ", ".join(f"${i}" for i in range(4, 4 + len(coords)))
+    llvm.inline_asm(
+        ir.Type.parse("!llvm.void"), [predicate, dst, desc, mbar, *coords],
+        f"@$0 cp.async.bulk.tensor.{len(coords)}d.shared::cta.global.tile.mbarrier::complete_tx::bytes [$1], [$2, {{{idx}}}], [$3];",
+        "b,r,l,r" + ",r" * len(coords), has_side_effects=True)
+
+
+def _tma_loads_cta_only():
+  from jax.experimental.mosaic.gpu import launch_context
+  if not isinstance(launch_context.nvvm, _CtaOnlyNvvm):
+    launch_context.nvvm = _CtaOnlyNvvm(launch_context.nvvm)
+
+
+_tma_loads_cta_only()
+
+
 def supported(head_dim, dtype, seq_len):
   """A swizzle-tile head dim and a sequence the (8, w) TMA tiles divide; fused_ops picks it on sm_12x only."""
   return head_dim in (16, 32, 64) and jnp.dtype(dtype) in (jnp.bfloat16, jnp.float16) and seq_len % 8 == 0
