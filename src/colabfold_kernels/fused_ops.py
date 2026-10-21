@@ -14,6 +14,23 @@ def _volta():
   return volta
 
 
+def register_ffi_targets(global_config):
+  """Load and register the FFI kernels this config can call, as tracing does on first use: a model compiled earlier
+  and loaded from disk calls them untraced."""
+  if not global_config.get('use_pallas', False):
+    return
+  cc = _legacy_cc(global_config)
+  if cc is not None:
+    va = _volta()
+    va.available(cc)
+    va.ops_available(cc)
+    va.packed_available(cc, 32)
+    va.packed_trim_available(cc)
+  if global_config.get('fp8', False):
+    from colabfold_kernels import contract
+    contract.available()
+
+
 def attention(global_config, dtype, key_dim, value_dim, layout='heads'):
   """-> f(q, k, v, mask_bias, nonbatched_bias, scale) or None.
 
