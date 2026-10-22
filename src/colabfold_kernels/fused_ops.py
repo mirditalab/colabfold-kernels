@@ -25,7 +25,6 @@ def register_ffi_targets(global_config):
     va.available(cc)
     va.ops_available(cc)
     va.packed_available(cc, 32)
-    va.packed_trim_available(cc)
   if global_config.get('fp8', False):
     from colabfold_kernels import contract
     contract.available()

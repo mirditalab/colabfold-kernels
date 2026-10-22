@@ -18,7 +18,7 @@ classifiers = [
   "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
 dependencies = [
-  "colabfold-legacy-kernels>=0.5.0,<0.6; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "colabfold-legacy-kernels>=0.6.0,<0.7; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "colabfold-cuda-kernels>=0.2.0,<0.3; sys_platform == 'linux'",
 ]
 [project.urls]

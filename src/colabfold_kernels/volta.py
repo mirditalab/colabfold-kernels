@@ -190,15 +190,8 @@ def volta_attention(q, k, v, mask_bias, nonbatched_bias, scale, cc,
 
 def packed_available(cc, head_dim):
     """True if this device's attention library reads packed q/k/v (packed_attn.packed_attention)."""
-    return head_dim in _native_dims(cc) and _load("attention", cc, (_attn_symbol(cc) + "Packed",))
-
-
-def packed_trim_available(cc):
-    """True if this device's attention library also takes trim limits (colabfold-legacy-kernels 0.6)."""
-    try:
-        return _load("attention", cc, (_attn_symbol(cc) + "PackedTrim",))
-    except AttributeError:
-        return False
+    return head_dim in _native_dims(cc) and _load("attention", cc, (_attn_symbol(cc) + "Packed",
+                                                                     _attn_symbol(cc) + "PackedTrim"))
 
 
 @functools.partial(jax.jit, static_argnames=("sm_scale", "column", "cc", "block_q", "block_k", "trim"))
@@ -206,14 +199,14 @@ def volta_packed_attention(p, bias, kmask, gate_bias=None, *, sm_scale, column=F
                            block_q=64, block_k=32, trim=False):
     """packed_attn.packed_attention for sm_70/75: p [X, Y, G, H, D] read in place, out [X, Y, H, D].
 
-    trim: packed_attn.packed_attention's, where the library has it (else every key and query run)."""
+    trim: packed_attn.packed_attention's."""
     X, Y, _, H, D = p.shape
     if cc >= 75 and D == 64 and (block_q, block_k) == (64, 32):
         block_k = 64    # the mma kernel has no (64, 64, 32) instantiation
     f16 = lambda t: t.astype(jnp.float16)
     gb = jnp.zeros((H, D), jnp.float16) if gate_bias is None else f16(gate_bias)
     lims = []
-    if trim and packed_trim_available(cc):
+    if trim:
         from colabfold_kernels.packed_attn import trim_limits
         lims = [jnp.concatenate(trim_limits(kmask, 1))]
     out = jax.ffi.ffi_call(_attn_symbol(cc) + ("PackedTrim" if lims else "Packed"),

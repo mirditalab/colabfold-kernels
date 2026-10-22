@@ -30,12 +30,12 @@ def available():
     try:
       import colabfold_cuda_kernels as cck
       path = cck.library_path("fp8_contract", cc)
-    except (ImportError, FileNotFoundError, KeyError):
+    except (ImportError, FileNotFoundError):
       return False
   try:
     lib = ctypes.cdll.LoadLibrary(path)
     jax.ffi.register_ffi_target(TARGET, jax.ffi.pycapsule(getattr(lib, TARGET)), platform="CUDA")
-  except (OSError, AttributeError):
+  except OSError:
     return False
   return True
 
