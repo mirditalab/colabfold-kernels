@@ -194,15 +194,18 @@ def packed_attention(p, bias, kmask, gate_bias=None, qk8=None, *, sm_scale, colu
       else:
         o, _, l = lax.fori_loop(0, nk, step, (o0, m0, l0))
       if trim:
-        # no key ran, or none of this row's (a padded row in a group that has keys): zeros, not 0 / 0 or an average
+        # no key ran, or none of this row's (a padded row in a group that has keys): zeros, not 0 / 0 or an average,
+        # selected after the gate, whose unwritten rows may hold anything
+        live = jnp.where((l > 0) & (lims_ref[nbg + 1 + b0 + wg] > 0), 1.0, 0.0)
         l = jnp.where(l > 0, l, jnp.inf)
-        o = o * jnp.where(lims_ref[nbg + 1 + b0 + wg] > 0, 1.0, 0.0)
       o = o / lax.broadcast_in_dim(l, o.shape, [0])
       if gated:
         plgpu.barrier_wait(g_bar.at[wg])
         g = plgpu.load(buf.at[wg], layout=ACC).astype(jnp.float32)
         g = g + lax.broadcast_in_dim(plgpu.load(gb_smem.at[wg, pl.ds(0, D)], layout=ACC.reduce(0)), o.shape, [1])
         o = o / (1. + jnp.exp2(-g * LOG2E))
+      if trim:
+        o = jnp.where(lax.broadcast_in_dim(live, o.shape, [0]) > 0, o, 0.0)
       buf.at[wg][...] = o.astype(dt)
       plgpu.commit_smem()
 

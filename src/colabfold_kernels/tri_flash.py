@@ -206,8 +206,9 @@ def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, *rest,
     # log2 domain, which is what the backward's exp2 wants
     plgpu.store(lse_ref, m_i + jnp.log2(l_i), mask=q_valid)
   if trim:
-    # no key ran: zeros, not 0 / 0
-    l_i = jnp.where(l_i > 0, l_i, jnp.inf)
+    # no key ran: zeros, not 0 / 0, nor whatever the gate's unwritten rows hold
+    empty = l_i <= 0
+    l_i = jnp.where(empty, jnp.inf, l_i)
   for oc, (off, w), c in zip(os, chunks, cols):
     m = q_valid[:, None] if c is None else q_valid[:, None] & c[None, :]
     o = oc / l_i[:, None]
@@ -216,6 +217,8 @@ def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, *rest,
       gb = (gb_ref[pl.dslice(off, w)] if c is None else
             plgpu.load(gb_ref.at[pl.dslice(off, w)], mask=c, other=0.0)).astype(jnp.float32)
       o = o * jax.nn.sigmoid(g + gb[None, :])
+    if trim:
+      o = jnp.where(empty[:, None], 0.0, o)
     plgpu.store(o_ref.at[:, pl.dslice(off, w)], o.astype(o_ref.dtype), mask=m)
 
 

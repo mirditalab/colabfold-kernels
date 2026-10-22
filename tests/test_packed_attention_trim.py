@@ -1,6 +1,7 @@
 """packed attention's trim: on a padded pair (tokens past n masked), the real rows match the untrimmed kernel and the
 padded ones are zero or untrimmed; on a mask with holes, every row the trim does not zero matches. Both the Triton kernel and,
-on sm_12x, the Mosaic GPU one; rows and columns, gated, bf16 and the e4m3 k/v / q/k slots."""
+on sm_12x, the Mosaic GPU one; rows and columns, gated, bf16 and the e4m3 k/v / q/k slots. poison: p NaN past the live
+block rounded to 128, what ln_projection leaves unwritten there; trimmed rows must still come out zero."""
 import sys
 
 import jax
@@ -32,7 +33,7 @@ def check(name, o, base, ref, keep):
     fails.append(name)
 
 
-def case(S, n, column, mosaic, fp8, holes=False):
+def case(S, n, column, mosaic, fp8, holes=False, poison=False):
   k = jax.random.split(jax.random.PRNGKey(S * 7 + n), 5)
   p = jax.random.normal(k[0], (S, S, 4, H, D)).astype(jnp.bfloat16)
   bias = jax.random.normal(k[1], (H, S, S)).astype(jnp.bfloat16)
@@ -52,6 +53,9 @@ def case(S, n, column, mosaic, fp8, holes=False):
       pp = p[:, :, jnp.array([0, 3])]
   f = fused_ops._mgpu_attn().packed_attention if mosaic else pa.packed_attention
   base = f(pp, bias, kmask, gb, *extra, **kw)
+  if poison:
+    out = jnp.arange(S) >= -(-n // 128) * 128
+    pp = jnp.where((out[:, None] | out[None, :])[:, :, None, None, None], jnp.nan, pp).astype(pp.dtype)
   o = f(pp, bias, kmask, gb, *extra, trim=True, **kw)
   ref = pa.ref_packed_attention(p, bias, kmask, gb, **kw)
   # rows trim keeps: batch rows with a key, and sequence positions before the last token
@@ -59,7 +63,7 @@ def case(S, n, column, mosaic, fp8, holes=False):
   rows = kmask.any(axis=1)[:, None] & (jnp.arange(S) < last)[None, :]
   keep = rows.T if column else rows
   name = f"{'mosaic' if mosaic else 'triton'} S={S} n={n} {'col' if column else 'row'}{' fp8' if fp8 else ''}" \
-         f"{' holes' if holes else ''}"
+         f"{' holes' if holes else ''}{' poison' if poison else ''}"
   # e4m3 slots: the f32 reference is not the yardstick, the untrimmed kernel is
   check(name, o, base, base.astype(jnp.float32) if fp8 else ref, keep)
 
@@ -72,6 +76,9 @@ for mosaic in ([False, True] if mosaic_ok else [False]):
       case(S, n, column, mosaic, fp8=False)
   case(256, 200, False, mosaic, fp8=False, holes=True)
   case(256, 200, True, mosaic, fp8=False, holes=True)
+  for S, n in [(384, 1), (384, 129), (256, 100)]:
+    for column in (False, True):
+      case(S, n, column, mosaic, fp8=False, poison=True)
   if fp8_ok:
     for column in (False, True):
       case(384, 300, column, mosaic, fp8=True)
