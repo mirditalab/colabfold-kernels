@@ -25,6 +25,8 @@ def register_ffi_targets(global_config):
     va.available(cc)
     va.ops_available(cc)
     va.packed_available(cc, 32)
+    for kernel in va._FUSED_SYMBOLS:
+      va.fused_available(cc, kernel)
   if global_config.get('fp8', False):
     from colabfold_kernels import contract
     contract.available()
@@ -281,7 +283,7 @@ def ln_projection(global_config, dtype, num_channel, num_output=None):
             and va.fused_available(cc, 'ln_projection')):
       return None
     return differentiable_via(functools.partial(va.volta_ln_projection, cc=cc), pa.ref_ln_projection,
-                              nondiff=('eps', 'f8_slots'))
+                              nondiff=('eps', 'f8_slots', 'f8_scales'))
   if not _pallas_half(global_config, dtype):
     return None
   from colabfold_kernels.grads import differentiable_via

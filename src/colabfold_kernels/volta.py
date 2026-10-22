@@ -274,8 +274,10 @@ def volta_gated_dual_proj(x, wp, bp, wg, bg, mask, cc, *, split=False,
     return halves[0], halves[1]
 
 
-# The LayerNorm-fused projections take the widths AF2 uses: pair 128, template stack 64.
+# The LayerNorm-fused projections take the widths AF2 uses: pair 128, template stack 64; the transition also the MSA's
+# 256 (a projection there streams its weights per row block, where cuBLAS reads them once a tile).
 FUSED_WIDTHS = (64, 128)
+MSA_WIDTHS = FUSED_WIDTHS + (256,)
 # The per-head attention bias is a row reduction in the kernel, for at most this many heads.
 _MAX_BIAS_HEADS = 8
 _FUSED_SYMBOLS = {"ln_gated_dual_proj": "VoltaLnGdp", "trimul_epilogue": "VoltaTrimulEpilogue",
@@ -303,8 +305,13 @@ def projection_supported(*widths):
 
 
 def transition_supported(num_channel, num_intermediate):
-    """AF2's transitions: factor 4 in the pair stack, 2 in the template stack."""
-    return num_channel in FUSED_WIDTHS and num_intermediate in (2 * num_channel, 4 * num_channel)
+    """AF2's transitions: factor 4 in the pair and MSA stacks, 2 in the template stack."""
+    return num_channel in MSA_WIDTHS and num_intermediate in (2 * num_channel, 4 * num_channel)
+
+
+def _keep(keep, m):
+    """keep [M] as the kernels take it, or a one-element placeholder: (array, has_keep)."""
+    return (jnp.zeros((1,), jnp.float16), False) if keep is None else (f16(keep.reshape(m)), True)
 
 
 f16 = lambda t: t.astype(jnp.float16)
@@ -321,35 +328,38 @@ def _ln_gdp_call(x, scale, offset, wp, bp, wg, bg, mask, *, sym, eps):
 
 
 def volta_ln_gated_dual_proj(x, ln_scale, ln_offset, wp, bp, wg, bg, mask, *, eps=1e-5, cc):
-    """tri_mul.ln_gated_dual_proj for sm_70/75: left, right [P/2, M] channel major from one read of x [M, K]."""
+    """tri_mul.ln_gated_dual_proj for sm_70/75: left, right [P/2, M] channel major from one read of x [M, K]. The mask
+    is also the keep: a row block it zeroes writes zeros without the work, one below zero is not written."""
     left, right = _ln_gdp_call(x, ln_scale, ln_offset, wp, bp, wg, bg, mask,
                                sym=_fused_symbol("VoltaLnGdp", cc), eps=eps)
     return left.astype(x.dtype), right.astype(x.dtype)
 
 
 @functools.partial(jax.jit, static_argnames=("sym", "eps", "add_input"))
-def _epilogue_call(x_cm, x, in_scale, in_offset, ln_scale, ln_offset, wo, bo, wg, bg, *, sym, eps, add_input):
+def _epilogue_call(x_cm, x, in_scale, in_offset, ln_scale, ln_offset, wo, bo, wg, bg, keep, *, sym, eps, add_input):
     out = jax.ShapeDtypeStruct((x.shape[0], wo.shape[1]), jnp.float16)
-    return jax.ffi.ffi_call(sym, out, vmap_method="sequential")(
+    keep, has_keep = _keep(keep, x.shape[0])
+    # with add_input the output aliases x: a row block keep skips holds x already
+    return jax.ffi.ffi_call(sym, out, vmap_method="sequential", input_output_aliases={1: 0} if add_input else {})(
         f32(x_cm), f16(x), f32(in_scale), f32(in_offset), f32(ln_scale), f32(ln_offset),
-        f16(wo.T), f16(bo), f16(wg.T), f16(bg), eps=np.float32(eps), add_input=add_input)
+        f16(wo.T), f16(bo), f16(wg.T), f16(bg), keep, eps=np.float32(eps), add_input=add_input, has_keep=has_keep)
 
 
-def volta_trimul_epilogue_ln(x_cm, x, in_scale, in_offset, ln_scale, ln_offset, wo, bo, wg, bg, *, eps=1e-5,
-                             add_input=False, cc):
+def volta_trimul_epilogue_ln(x_cm, x, in_scale, in_offset, ln_scale, ln_offset, wo, bo, wg, bg, keep=None, *,
+                             eps=1e-5, add_input=False, cc):
     """tri_mul.trimul_epilogue_ln for sm_70/75. Widths the kernel does not take run the reference in XLA."""
     c, ca, o = x_cm.shape[0], x.shape[1], wo.shape[1]
-    if not projection_supported(c, ca, o) or (add_input and o != ca):
+    if not ln_gdp_supported(c, ca) or o not in FUSED_WIDTHS or (add_input and o != ca):
         from colabfold_kernels.tri_mul import ref_trimul_epilogue_ln
-        return ref_trimul_epilogue_ln(x_cm, x, in_scale, in_offset, ln_scale, ln_offset, wo, bo, wg, bg, eps=eps,
-                                      add_input=add_input).astype(x.dtype)
-    out = _epilogue_call(x_cm, x, in_scale, in_offset, ln_scale, ln_offset, wo, bo, wg, bg,
+        return ref_trimul_epilogue_ln(x_cm, x, in_scale, in_offset, ln_scale, ln_offset, wo, bo, wg, bg, keep,
+                                      eps=eps, add_input=add_input).astype(x.dtype)
+    out = _epilogue_call(x_cm, x, in_scale, in_offset, ln_scale, ln_offset, wo, bo, wg, bg, keep,
                          sym=_fused_symbol("VoltaTrimulEpilogue", cc), eps=eps, add_input=add_input)
     return out.astype(x.dtype)
 
 
 @functools.partial(jax.jit, static_argnames=("sym", "eps"))
-def _ln_proj_call(x, scale, offset, w, wb, *, sym, eps):
+def _ln_proj_call(x, scale, offset, w, wb, keep, *, sym, eps):
     m, a = x.shape
     n = 0 if w is None else w.shape[0] * w.shape[2]
     heads = 0 if wb is None else wb.shape[1]
@@ -359,50 +369,62 @@ def _ln_proj_call(x, scale, offset, w, wb, *, sym, eps):
     wbt = unused if wb is None else f16(wb.T)
     shapes = (jax.ShapeDtypeStruct((m, n) if n else (1,), jnp.float16),
               jax.ShapeDtypeStruct((heads, m) if heads else (1,), jnp.float16))
+    keep, has_keep = _keep(keep, m)
     p, bias = jax.ffi.ffi_call(sym, shapes, vmap_method="sequential")(
-        f16(x), f32(scale), f32(offset), wt, wbt, eps=np.float32(eps), n=np.int64(n), heads=np.int64(heads))
+        f16(x), f32(scale), f32(offset), wt, wbt, keep, eps=np.float32(eps), n=np.int64(n), heads=np.int64(heads),
+        has_keep=has_keep)
     return (p if n else None), (bias if heads else None)
 
 
-def volta_ln_projection(x, ln_scale, ln_offset, w=None, wb=None, *, eps=1e-5, f8_slots=(), cc):
-    """packed_attn.ln_projection for sm_70/75: (p [M, G*n], bias [h, M]) from one read of x [M, a]."""
+def volta_ln_projection(x, ln_scale, ln_offset, w=None, wb=None, keep=None, *, eps=1e-5, f8_slots=(), f8_scales=None,
+                        cc):
+    """packed_attn.ln_projection for sm_70/75: (p [M, G*n], bias [h, M]) from one read of x [M, a]. keep [M]: a row
+    block with none writes zeros without the work, one below zero everywhere is not written."""
     if f8_slots:
         raise ValueError("e4m3 slots need compute capability 8.9, not the sm_70/75 kernels")
     if wb is not None and wb.shape[1] > _MAX_BIAS_HEADS:
         from colabfold_kernels.packed_attn import ref_ln_projection
-        out = ref_ln_projection(x, ln_scale, ln_offset, w, wb, eps=eps)
+        out = ref_ln_projection(x, ln_scale, ln_offset, w, wb, keep, eps=eps)
     else:
-        out = _ln_proj_call(x, ln_scale, ln_offset, w, wb, sym=_fused_symbol("VoltaLnProj", cc), eps=eps)
+        out = _ln_proj_call(x, ln_scale, ln_offset, w, wb, keep, sym=_fused_symbol("VoltaLnProj", cc), eps=eps)
     return tuple(None if t is None else t.astype(x.dtype) for t in out)
 
 
 @functools.partial(jax.jit, static_argnames=("sym",))
-def _out_proj_call(o, w, b, residual, *, sym):
+def _out_proj_call(o, w, b, residual, keep, *, sym):
     res = jnp.zeros((1,), jnp.float16) if residual is None else f16(residual)
     out = jax.ShapeDtypeStruct((o.shape[0], w.shape[1]), jnp.float16)
-    return jax.ffi.ffi_call(sym, out, vmap_method="sequential")(
-        f16(o), f16(w.T), f16(b), res, has_residual=residual is not None)
+    keep, has_keep = _keep(keep, o.shape[0])
+    # the output aliases the residual: a row block keep skips holds it already
+    return jax.ffi.ffi_call(sym, out, vmap_method="sequential",
+                            input_output_aliases={} if residual is None else {3: 0})(
+        f16(o), f16(w.T), f16(b), res, keep, has_residual=residual is not None, has_keep=has_keep)
 
 
-def volta_output_projection(o, w, b, residual=None, *, cc):
-    """packed_attn.output_projection for sm_70/75: o [M, k] @ w [k, c] + b, plus residual, in one pass."""
-    out = _out_proj_call(o, w, b, residual, sym=_fused_symbol("VoltaOutProj", cc))
+def volta_output_projection(o, w, b, residual=None, keep=None, *, cc):
+    """packed_attn.output_projection for sm_70/75: o [M, k] @ w [k, c] + b, plus residual, in one pass. keep [M]: a
+    row block with none writes zeros (or keeps the residual) without the work."""
+    out = _out_proj_call(o, w, b, residual, keep, sym=_fused_symbol("VoltaOutProj", cc))
     return out.astype(o.dtype if residual is None else residual.dtype)
 
 
 @functools.partial(jax.jit, static_argnames=("sym", "eps", "add_input"))
-def _transition_call(x, scale, offset, w1, b1, w2, b2, *, sym, eps, add_input):
+def _transition_call(x, scale, offset, w1, b1, w2, b2, keep, *, sym, eps, add_input):
     h, c = w2.shape
     # w2 as row chunks of the hidden dim, each transposed, so a chunk is one [c, chunk] tile
     w2t = jnp.swapaxes(w2.reshape(h // _HIDDEN_CHUNK, _HIDDEN_CHUNK, c), 1, 2)
-    return jax.ffi.ffi_call(sym, jax.ShapeDtypeStruct(x.shape, jnp.float16), vmap_method="sequential")(
-        f16(x), f32(scale), f32(offset), f16(w1.T), f16(b1), f16(w2t), f16(b2),
-        eps=np.float32(eps), add_input=add_input)
+    keep, has_keep = _keep(keep, x.shape[0])
+    # with add_input the output aliases x: a row block keep skips holds x already
+    return jax.ffi.ffi_call(sym, jax.ShapeDtypeStruct(x.shape, jnp.float16), vmap_method="sequential",
+                            input_output_aliases={0: 0} if add_input else {})(
+        f16(x), f32(scale), f32(offset), f16(w1.T), f16(b1), f16(w2t), f16(b2), keep,
+        eps=np.float32(eps), add_input=add_input, has_keep=has_keep)
 
 
-def volta_transition(x, ln_scale, ln_offset, w1, b1, w2, b2, *, eps=1e-5, add_input=False, cc):
-    """transition.fused_transition for sm_70/75: relu(LN(x) @ w1 + b1) @ w2 + b2 (+ x), x [..., C]."""
+def volta_transition(x, ln_scale, ln_offset, w1, b1, w2, b2, keep=None, *, eps=1e-5, add_input=False, cc):
+    """transition.fused_transition for sm_70/75: relu(LN(x) @ w1 + b1) @ w2 + b2 (+ x), x [..., C]. keep [...]: a
+    row block with none writes zeros (or keeps x) without the work."""
     c = x.shape[-1]
-    out = _transition_call(x.reshape(-1, c), ln_scale, ln_offset, w1, b1, w2, b2,
+    out = _transition_call(x.reshape(-1, c), ln_scale, ln_offset, w1, b1, w2, b2, keep,
                            sym=_fused_symbol("VoltaTransition", cc), eps=eps, add_input=add_input)
     return out.reshape(x.shape).astype(x.dtype)
