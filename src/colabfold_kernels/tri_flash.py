@@ -30,16 +30,21 @@ def e4m3(x):
 
 
 def exp2(x):
-  """In a kernel: 2^x as one ex2.approx.ftz.f32 on CUDA; jnp.exp2's libdevice call adds a denormal fixup around it."""
-  if is_rocm() or x.dtype != jnp.float32:
+  """In a kernel: 2^x as one ex2.approx.ftz.f32 on CUDA, one v_exp_f32 on ROCm; jnp.exp2 adds a denormal fixup around
+  it, which a softmax's x <= 0 does not need."""
+  if x.dtype != jnp.float32:
     return jnp.exp2(x)
-  [r] = plgpu.elementwise_inline_asm("ex2.approx.ftz.f32 $0, $1;", args=[x], constraints="=f,f", pack=1,
+  asm, constraints = ("v_exp_f32 $0, $1", "=v,v") if is_rocm() else ("ex2.approx.ftz.f32 $0, $1;", "=f,f")
+  [r] = plgpu.elementwise_inline_asm(asm, args=[x], constraints=constraints, pack=1,
                                      result_shape_dtypes=[jax.ShapeDtypeStruct(x.shape, x.dtype)])
   return r
 
 
 def sub_exp2_h(x, m):
-  """In a kernel, CUDA only: 2^(x - m) for f16 x and m, two at a time (sub.f16x2, ex2.approx.f16x2)."""
+  """In a kernel: 2^(x - m) for f16 x and m, two at a time on CUDA (sub.f16x2, ex2.approx.f16x2); on ROCm, where that
+  PTX would be garbage, an f16 subtract and v_exp_f16."""
+  if is_rocm():
+    return jnp.exp2(x - m)
   [r] = plgpu.elementwise_inline_asm("{ .reg .b32 t; sub.f16x2 t, $1, $2; ex2.approx.f16x2 $0, t; }", args=[x, m],
                                      constraints="=r,r,r", pack=2,
                                      result_shape_dtypes=[jax.ShapeDtypeStruct(x.shape, jnp.float16)])
@@ -79,12 +84,13 @@ def _chunks(d):
 
 def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, *rest,
             sm_scale, block_q, block_k, sq, d, chunks, gated=False, fp8=False, prefix=False, half=False, group=1,
-            trim=False):
+            trim=False, log2_bias=False):
   # gated: a gate [block_q, W] and its bias [W] come first, the output is o * sigmoid(gate + bias)
   # fp8: k and v come in e4m3 (fp8_supported), q is cast here, both dots accumulate in fp32
   # prefix: the row's count of leading key blocks with no masked key comes first; those skip the key mask
   # half (CUDA): the scores in f16, the bias (log2 domain, f16) the q.k^T accumulator, packed f16 max, subtract and
   # exp2; the row sum p.1 on the tensor cores
+  # log2_bias (ROCm's bf16 path): the bias comes times log2(e) and q is scaled once here, one add a score instead of three
   # trim: after the prefix, the row's count of key blocks up to its last unmasked key, and the token count past which
   # every query is padding; blocks past the first are skipped, a row with no key or a query block past the second
   # writes zeros (a padded row, which averaged its masked keys before)
@@ -111,6 +117,8 @@ def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, *rest,
     qs = [e4m3(qc) for qc in qs]
   if half:
     qs = [(qc.astype(jnp.float32) * (sm_scale * LOG2E)).astype(jnp.float16) for qc in qs]
+  elif log2_bias:
+    qs = [(qc.astype(jnp.float32) * (sm_scale * LOG2E)).astype(qc.dtype) for qc in qs]
   m_i = jnp.full(block_q, -float('inf'), jnp.float16 if half else jnp.float32)
   # half: the row sum as p.1 on the tensor cores - in v's padding column d when the head is narrower than its tile,
   # else as a dot of its own, every one of whose 16 columns is the sum
@@ -134,7 +142,7 @@ def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, *rest,
       part = _dot(qc, kc.T)                    # [block_q, block_k]
       qk = part if qk is None else qk + part
     bias = plgpu.load(bias_ref.at[:, sl], mask=_and(q_valid[:, None], None if kb is None else kb[None, :]), other=0.0)
-    qk = (qk * sm_scale + bias) * LOG2E
+    qk = qk + bias if log2_bias else (qk * sm_scale + bias) * LOG2E
     if masked:
       km = _load(kmask_ref.at[sl], kb, False)
       # masked keys share a finite floor; keys past Sk get none, so a fully masked row averages Sk keys
@@ -257,9 +265,13 @@ def tri_flash(q, k, v, bias, kmask, *, sm_scale, block_q=64, block_k=64,
   out_specs = bs_qo if not want_lse else [bs_qo, bs_lse]
   if want_lse:
     out_shape = [out_shape, jax.ShapeDtypeStruct((N, H, Sq), jnp.float32)]
+  # ROCm: the bias in the log2 domain, q scaled in the kernel (one add a score); the lse comes out the same
+  log2_bias = is_rocm()
+  if log2_bias:
+    bias = (bias.astype(jnp.float32) * LOG2E).astype(bias.dtype)
   return pl.pallas_call(
       functools.partial(_kernel, sm_scale=sm_scale, block_q=block_q,
-                        block_k=block_k, sq=Sq, d=D, chunks=chunks),
+                        block_k=block_k, sq=Sq, d=D, chunks=chunks, log2_bias=log2_bias),
       grid=grid,
       in_specs=[bs_qo, bs_kv, bs_kv, bs_bias, bs_mask],
       out_specs=out_specs,
@@ -392,17 +404,21 @@ def tri_flash_bwd(q, k, v, bias, kmask, out, dout, lse, *, sm_scale,
   return dq.astype(q.dtype), dk, dv, dbias
 
 
+def _fwd_tiles():
+  """The forward's q block and stages: 128 and one on ROCm (as packed_attention), else 64 and two."""
+  return dict(block_q=128, num_stages=1) if is_rocm() else dict(block_q=64, num_stages=2)
+
+
 @functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6))
 def _attn_diff(q, k, v, bias, kmask, sm_scale, seq_major):
   block_k = _pow2_tile(min(64, q.shape[-1]))
-  return tri_flash(q, k, v, bias, kmask, sm_scale=sm_scale, block_q=64,
-                   block_k=block_k, seq_major=seq_major)
+  return tri_flash(q, k, v, bias, kmask, sm_scale=sm_scale, block_k=block_k, seq_major=seq_major, **_fwd_tiles())
 
 
 def _attn_diff_fwd(q, k, v, bias, kmask, sm_scale, seq_major):
   block_k = _pow2_tile(min(64, q.shape[-1]))
-  out, lse = tri_flash(q, k, v, bias, kmask, sm_scale=sm_scale, block_q=64,
-                       block_k=block_k, seq_major=seq_major, want_lse=True)
+  out, lse = tri_flash(q, k, v, bias, kmask, sm_scale=sm_scale, block_k=block_k, seq_major=seq_major, want_lse=True,
+                       **_fwd_tiles())
   return out, (q, k, v, bias, kmask, out, lse)
 
 

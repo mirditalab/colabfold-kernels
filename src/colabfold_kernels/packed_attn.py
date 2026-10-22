@@ -29,13 +29,14 @@ def packed_attention(p, bias, kmask, gate_bias=None, kv=None, *, sm_scale, colum
   """p [X, Y, G, H, D] (G = 3, or 4 with a gate); bias [H, Sq, Sk]; kmask [batch, Sk] bool;
   gate_bias [H, D] when G == 4. Rows: batch X, sequence Y; column: batch Y, sequence X.
   kv [X, Y, 2, H, D], the k and v slots in e4m3, leaves p with q and the gate: both dots then run e4m3.
-  half: the softmax in f16, by default when p is f16 on CUDA (a bf16 p's conversion in the kernel costs what it saves).
+  half: the softmax in f16, by default when p is f16 (a bf16 p's conversion in the kernel costs what it saves).
   The output is out_dtype, else p's. group: batches a q block runs adjacent (see the grid), 0 for none; by default 16
   once the bias outgrows half the L2, else none.
   trim: skip what padding costs (see trim_limits): a row's key blocks past its last unmasked key, and every query past
   the last token any row lets through; those queries and rows with no unmasked key give zeros."""
   X, Y, G, H, D = p.shape
-  half = (p.dtype == jnp.float16 and kv is None and not is_rocm()) if half is None else half
+  rocm = is_rocm()
+  half = (p.dtype == jnp.float16 and kv is None) if half is None else half
   assert not (half and kv is not None)
   G += 0 if kv is None else 2
   gated = G == 4
@@ -45,18 +46,21 @@ def packed_attention(p, bias, kmask, gate_bias=None, kv=None, *, sm_scale, colum
   dk = chunks[-1][0] + chunks[-1][1]
   # swept on sm_120 at the triangle and MSA shapes: 12-17% over block_q=64; half on the A100: rows 64 x 64, 1.2-1.4x
   # over 128 x 32 (fewer registers, more warps a scheduler), columns as they were
-  block_q = block_q or (64 if half and not column else 128)
-  block_k = block_k or (64 if half and not column else _pow2_tile(min(32, D)))
+  # ROCm, swept for both softmaxes, rows and columns: 128 x 64 and one stage
+  block_q = block_q or (128 if rocm else 64 if half and not column else 128)
+  block_k = block_k or (64 if rocm or (half and not column) else _pow2_tile(min(32, D)))
   fp8 = kv is not None
   assert not fp8 or fp8_supported(D, block_k), (D, block_k)
-  num_stages = num_stages or (3 if column else 2)
+  num_stages = num_stages or (1 if rocm else 3 if column else 2)
   # CUDA runs the grid's first axis fastest. grid (q_block, head, batch) sweeps every head's q blocks for one batch, so
   # each batch reads the whole bias; group G: (G batches x q_block, head, batch group), a q block's G batches adjacent
   # (one bias tile read for G) and a group's K/V in L2 across its q blocks
   nq = pl.cdiv(s, block_q)
   if group is None:
-    # grouping pays once the bias outgrows half the L2, and costs while it fits; 20 MB where jax cannot tell the L2
-    group = 16 if not is_rocm() and H * s * s * 2 >= (l2_cache_size() or 40 << 20) // 2 else 0
+    # grouping pays once the bias outgrows half the L2, and costs while it fits; 20 MB where jax cannot tell the L2.
+    # ROCm (jax reports no L2): 8 once the bias outgrows the last-level cache, and none while the cache holds it
+    bias_bytes = H * s * s * 2
+    group = (8 if bias_bytes > 64 << 20 else 0) if rocm else 16 if bias_bytes >= (l2_cache_size() or 40 << 20) // 2 else 0
   if group:
     grid = (group * nq, H, pl.cdiv(nb, group))
     # a last group's batches past nb repeat the last one: the same output written twice
@@ -79,8 +83,10 @@ def packed_attention(p, bias, kmask, gate_bias=None, kv=None, *, sm_scale, colum
   # every batch re-reads the bias, most of the kernel's L2 traffic: rows padded to 128 bytes keep a key block's
   # slice of it from straddling one more 32-byte sector (1,048 keys: 15% slower unpadded)
   sp = -(-s // 64) * 64
-  # half: the bias in f16 in the log2 domain, negated (the kernel subtracts it)
-  bias = (bias.astype(jnp.float32) * -LOG2E).astype(jnp.float16) if half else bias.astype(p.dtype)
+  # half: the bias in f16 in the log2 domain, negated (the kernel subtracts it); ROCm's bf16 path takes it in log2 too
+  log2_bias = rocm and not half and not fp8
+  bias = ((bias.astype(jnp.float32) * -LOG2E).astype(jnp.float16) if half else
+          (bias.astype(jnp.float32) * LOG2E).astype(p.dtype) if log2_bias else bias.astype(p.dtype))
   bias = jnp.pad(bias, ((0, 0), (0, 0), (0, sp - s)))
   in_specs = [q_spec(0), kv_spec(ks), kv_spec(vs), pl.BlockSpec((None, block_q, sp), at(lambda i, h, j: (h, i, 0))),
               pl.BlockSpec((None, s), at(lambda i, h, j: (j, 0)))]
@@ -98,7 +104,8 @@ def packed_attention(p, bias, kmask, gate_bias=None, kv=None, *, sm_scale, colum
     args += [p, gate_bias]
   return pl.pallas_call(
       functools.partial(_kernel, sm_scale=sm_scale, block_q=block_q, block_k=block_k, sq=s, d=D,
-                        chunks=chunks, gated=gated, fp8=fp8, prefix=True, half=half, group=group or 1, trim=trim),
+                        chunks=chunks, gated=gated, fp8=fp8, prefix=True, half=half, group=group or 1, trim=trim,
+                        log2_bias=log2_bias),
       grid=grid,
       in_specs=in_specs,
       out_specs=o_spec,

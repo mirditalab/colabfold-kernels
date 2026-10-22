@@ -125,11 +125,12 @@ def _mosaic_or_triton(p, bias, kmask, gate_bias=None, p8=None, *, sm_scale, colu
 
 def half_attention(global_config):
   """Triton's packed attention with its softmax in f16, from a projection written in f16: on Ampere and Hopper, where
-  the f32 softmax is the kernel's bottleneck (A100: 1.2-1.4x); not with FP8, nor where Mosaic GPU runs (sm_12x)."""
+  the f32 softmax is the kernel's bottleneck (A100: 1.2-1.4x), and on ROCm, where the bf16 softmax rounds p in software;
+  not with FP8, nor where Mosaic GPU runs (sm_12x)."""
   from colabfold_kernels.device import compute_capability, is_rocm
   cc = compute_capability()
   return (global_config.get('half_attention', True) and not global_config.get('fp8', False)
-          and cc is not None and 80 <= cc < 100 and not is_rocm())
+          and (is_rocm() or cc is not None and 80 <= cc < 100))
 
 
 def packed_attention(global_config, dtype, key_dim, value_dim):
