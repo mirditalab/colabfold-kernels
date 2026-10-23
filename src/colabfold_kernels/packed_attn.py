@@ -187,9 +187,10 @@ def ln_projection_supported(a, n=None):
   return a & (a - 1) == 0 and 16 <= a <= 256 and (n is None or projection_supported(n) or n in (256, 384, 512))
 
 
-def _ln_proj_kernel(x_ref, s_ref, offset_ref, *refs, eps, m, block_m, slots, heads, f8_slots, f8_scales, keep):
-  # refs: w [slots, a, n] if slots, wb [a, heads] if heads, keep [block_m] if keep, then the outputs in the same order,
-  # the e4m3 one last
+def _ln_proj_kernel(x_ref, s_ref, offset_ref, *refs, eps, m, block_m, slots, heads, f8_slots, f8_scales, keep,
+                    bias_dot):
+  # refs: w [slots, a, n] if slots, wb [a, heads padded] (bias_dot) or [heads, a] if heads, keep [block_m] if keep, then
+  # the outputs in the same order, the e4m3 one last
   refs = list(refs)
   w_ref = refs.pop(0) if slots else None
   wb_ref = refs.pop(0) if heads else None
@@ -198,7 +199,8 @@ def _ln_proj_kernel(x_ref, s_ref, offset_ref, *refs, eps, m, block_m, slots, hea
   b_ref = refs.pop(0) if heads else None
   p8_ref = refs.pop(0) if f8_slots else None
   rows = (pl.program_id(0) * block_m + jnp.arange(block_m)) < m
-  hm = (jnp.arange(b_ref.shape[0]) < heads) if heads else None
+  hm = (jnp.arange(b_ref.shape[0]) < heads) if heads and bias_dot else None
+  bias_rows = None if hm is None else hm[:, None] & rows[None, :]
   outs = [r for r in (p_ref, p8_ref) if r is not None]
 
   def compute():
@@ -217,16 +219,19 @@ def _ln_proj_kernel(x_ref, s_ref, offset_ref, *refs, eps, m, block_m, slots, hea
         else:
           plgpu.store(p_ref.at[:, pl.ds(half.index(g) * n + c0, chunk)], out.astype(p_ref.dtype),
                       mask=rows[:, None])
-    if heads:
+    if heads and bias_dot:
       wbt = plgpu.load(wb_ref, mask=hm[None, :], other=0.0)
       b = _dot(y, wbt).T
-      plgpu.store(b_ref, b.astype(b_ref.dtype), mask=hm[:, None] & rows[None, :])
+      plgpu.store(b_ref, b.astype(b_ref.dtype), mask=bias_rows)
+    for h in range(0 if bias_dot else heads):
+      b = jnp.sum(y.astype(jnp.float32) * wb_ref[h][None, :].astype(jnp.float32), axis=1)
+      plgpu.store(b_ref.at[h], b.astype(b_ref.dtype), mask=rows)
 
   def padding():  # rows keep leaves out: zeros
     for o in outs:
       plgpu.store(o, jnp.zeros(o.shape, jnp.float32).astype(o.dtype), mask=rows[:, None])
     if b_ref is not None:
-      plgpu.store(b_ref, jnp.zeros(b_ref.shape, b_ref.dtype), mask=hm[:, None] & rows[None, :])
+      plgpu.store(b_ref, jnp.zeros(b_ref.shape, b_ref.dtype), mask=rows[None, :] if hm is None else bias_rows)
 
   unless_padding(keep_ref, rows, compute, padding)
 
@@ -278,10 +283,12 @@ def ln_projection(x, ln_scale, ln_offset, w=None, wb=None, keep=None, *, eps=1e-
     args.append(w)
     out_specs.append(pl.BlockSpec((block_m, (slots - len(f8_slots)) * n), lambda i: (i, 0)))
     out_shape.append(jax.ShapeDtypeStruct((m, (slots - len(f8_slots)) * n), p_dtype or x.dtype))
+  # the bias heads as one dot where that pays (sm_80); elsewhere row reductions: the dot pads a few heads to 16 columns
+  bias_dot = cc == 80
   if heads:
-    bh = max(16, 1 << (heads - 1).bit_length())
-    in_specs.append(pl.BlockSpec((a, bh), lambda i: (0, 0)))
-    args.append(wb)
+    bh = max(16, 1 << (heads - 1).bit_length()) if bias_dot else heads
+    in_specs.append(pl.BlockSpec((a, bh) if bias_dot else (heads, a), lambda i: (0, 0)))
+    args.append(wb if bias_dot else wb.T)
     out_specs.append(pl.BlockSpec((bh, block_m), lambda i: (0, i)))
     out_shape.append(jax.ShapeDtypeStruct((heads, m), x.dtype))
   if keep is not None:
@@ -292,7 +299,7 @@ def ln_projection(x, ln_scale, ln_offset, w=None, wb=None, keep=None, *, eps=1e-
     out_shape.append(jax.ShapeDtypeStruct((m, len(f8_slots) * n), jnp.float8_e4m3fn))
   out = pl.pallas_call(
       functools.partial(_ln_proj_kernel, eps=eps, m=m, block_m=block_m, slots=slots, heads=heads,
-                        f8_slots=f8_slots, f8_scales=f8_scales, keep=keep is not None),
+                        f8_slots=f8_slots, f8_scales=f8_scales, keep=keep is not None, bias_dot=bias_dot),
       grid=(pl.cdiv(m, block_m),),
       in_specs=in_specs,
       out_specs=out_specs,
