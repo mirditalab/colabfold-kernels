@@ -127,7 +127,7 @@ def _mgpu_attn():
 def _mosaic_or_triton(p, bias, kmask, gate_bias=None, p8=None, *, sm_scale, column=False, out_dtype=None, trim=False):
   """The Mosaic GPU kernel where it runs, else Triton's. p8 holds the e4m3 slots fp8_attention chose for that kernel."""
   from colabfold_kernels import packed_attn as pa
-  if _mosaic_runs(p.shape[-1], p.dtype, p.shape[0 if column else 1]):
+  if bias is not None and _mosaic_runs(p.shape[-1], p.dtype, p.shape[0 if column else 1]):
     return _mgpu_attn().packed_attention(p, bias, kmask, gate_bias, p8, sm_scale=sm_scale, column=column, trim=trim)
   return pa.packed_attention(p, bias, kmask, gate_bias, p8, sm_scale=sm_scale, column=column, out_dtype=out_dtype,
                              trim=trim)
@@ -353,6 +353,17 @@ def opm_outer(global_config, dtype, rows, num_inner, d, num_output):
   if not opm.outer_supported(rows, num_inner, d, num_output):
     return None
   return differentiable_via(opm.opm_outer, opm.ref_opm_outer)
+
+
+def opm_projection(global_config, dtype, num_channel, num_outer):
+  """-> f(x, ln_scale, ln_offset, lw, lb, rw, rb, mask, *, eps) -> (left_act, right_act) or None."""
+  if not _pallas_half(global_config, dtype):
+    return None
+  from colabfold_kernels.grads import differentiable_via
+  from colabfold_kernels import opm
+  if not opm.proj_supported(num_channel, num_outer):
+    return None
+  return differentiable_via(opm.opm_projection, opm.ref_opm_projection, nondiff=('eps',))
 
 
 def layer_norm(global_config, dtype):

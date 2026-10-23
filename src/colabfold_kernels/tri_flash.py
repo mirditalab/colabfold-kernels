@@ -51,6 +51,12 @@ def sub_exp2_h(x, m):
   return r
 
 
+def _fast_sigmoid(x):
+  if is_rocm():
+    return jax.nn.sigmoid(x)
+  return 0.5 + 0.5 * plgpu.approx_tanh(0.5 * x)
+
+
 def _and(a, b):
   """a & b, where None is no mask."""
   return b if a is None else a if b is None else a & b
@@ -82,9 +88,9 @@ def _chunks(d):
   return tuple(out) if off < tile else ((0, tile),)
 
 
-def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, *rest,
+def _kernel(q_ref, k_ref, v_ref, *rest,
             sm_scale, block_q, block_k, sq, d, chunks, gated=False, fp8=False, prefix=False, half=False, group=1,
-            trim=False, log2_bias=False):
+            trim=False, log2_bias=False, biased=True):
   # gated: a gate [block_q, W] and its bias [W] come first, the output is o * sigmoid(gate + bias)
   # fp8: k and v come in e4m3 (fp8_supported), q is cast here, both dots accumulate in fp32
   # prefix: the row's count of leading key blocks with no masked key comes first; those skip the key mask
@@ -94,6 +100,8 @@ def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, *rest,
   # trim: after the prefix, the row's count of key blocks up to its last unmasked key, and the token count past which
   # every query is padding; blocks past the first are skipped, a row with no key or a query block past the second
   # writes zeros (a padded row, which averaged its masked keys before)
+  bias_ref, *rest = rest if biased else (None, *rest)
+  kmask_ref, *rest = rest
   pre_ref, *rest = rest if prefix else (None, *rest)
   end_ref, lim_ref, *rest = rest if trim else (None, None, *rest)
   g_ref, gb_ref, *rest = rest if gated else (None, None, *rest)
@@ -141,8 +149,11 @@ def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, *rest,
       kc = _load(k_ref.at[sl, pl.dslice(off, w)], m, 0.0)
       part = _dot(qc, kc.T)                    # [block_q, block_k]
       qk = part if qk is None else qk + part
-    bias = plgpu.load(bias_ref.at[:, sl], mask=_and(q_valid[:, None], None if kb is None else kb[None, :]), other=0.0)
-    qk = qk + bias if log2_bias else (qk * sm_scale + bias) * LOG2E
+    if bias_ref is not None:
+      bias = plgpu.load(bias_ref.at[:, sl], mask=_and(q_valid[:, None], None if kb is None else kb[None, :]), other=0.0)
+      qk = qk + bias if log2_bias else (qk * sm_scale + bias) * LOG2E
+    elif not log2_bias:
+      qk = qk * (sm_scale * LOG2E)
     if masked:
       km = _load(kmask_ref.at[sl], kb, False)
       # masked keys share a finite floor; keys past Sk get none, so a fully masked row averages Sk keys
@@ -168,8 +179,10 @@ def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, *rest,
       part = jnp.dot(qc, kc.T, preferred_element_type=jnp.float16)
       qk = part if qk is None else qk + part
     # the bias comes negated and is subtracted: added, Triton folds it into the dot's accumulator, whose load the
-    # pipeliner then leaves synchronous
-    qk = qk - plgpu.load(bias_ref.at[:, sl], mask=_and(q_valid[:, None], None if kb is None else kb[None, :]), other=0.0)
+    # pipeliner then leaves synchronous; packed_attention pads bias_ref's key axis to a multiple of block_k
+    if bias_ref is not None:
+      bmask = q_valid[:, None] if bias_ref.shape[1] > sk else _and(q_valid[:, None], None if kb is None else kb[None, :])
+      qk = qk - plgpu.load(bias_ref.at[:, sl], mask=bmask, other=0.0)
     if masked:
       km = _load(kmask_ref.at[sl], kb, False)
       qk = jnp.where(km[None, :], qk, NEG16 if kb is None else jnp.where(kb, NEG16, -jnp.inf)[None, :].astype(qk.dtype))
@@ -217,14 +230,15 @@ def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, *rest,
     # no key ran: zeros, not 0 / 0, nor whatever the gate's unwritten rows hold
     empty = l_i <= 0
     l_i = jnp.where(empty, jnp.inf, l_i)
+  inv_l = (1.0 / l_i)[:, None]
   for oc, (off, w), c in zip(os, chunks, cols):
     m = q_valid[:, None] if c is None else q_valid[:, None] & c[None, :]
-    o = oc / l_i[:, None]
+    o = oc * inv_l
     if gated:
       g = plgpu.load(g_ref.at[:, pl.dslice(off, w)], mask=m, other=0.0).astype(jnp.float32)
       gb = (gb_ref[pl.dslice(off, w)] if c is None else
             plgpu.load(gb_ref.at[pl.dslice(off, w)], mask=c, other=0.0)).astype(jnp.float32)
-      o = o * jax.nn.sigmoid(g + gb[None, :])
+      o = o * _fast_sigmoid(g + gb[None, :])
     if trim:
       o = jnp.where(empty[:, None], 0.0, o)
     plgpu.store(o_ref.at[:, pl.dslice(off, w)], o.astype(o_ref.dtype), mask=m)

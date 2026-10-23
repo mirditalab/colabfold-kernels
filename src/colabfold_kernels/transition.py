@@ -12,7 +12,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
-from colabfold_kernels.device import is_rocm
+from colabfold_kernels.device import compute_capability, is_rocm
 
 _dot = functools.partial(jnp.dot, preferred_element_type=jnp.float32)
 
@@ -95,8 +95,9 @@ def _kernel(x_ref, s_ref, o_ref_ln, w1_ref, b1_ref, w2_ref, b2_ref, *refs, eps, 
 
 
 def supported(c, hdim):
-  # gfx1151: 1.9x over XLA at 128 channels, no faster at 256
-  return c & (c - 1) == 0 and 16 <= c <= (128 if is_rocm() else 256) and hdim % 64 == 0
+  # 1.9x over XLA at 128 channels; at 256 (1 MB of weights) XLA's GEMM is 1.4-2.5x faster on A100 and gfx1151
+  top = 128 if is_rocm() or compute_capability() == 80 else 256
+  return c & (c - 1) == 0 and 16 <= c <= top and hdim % 64 == 0
 
 
 @functools.partial(jax.jit, static_argnames=("eps", "add_input", "block_m", "chunk", "num_warps",
@@ -111,15 +112,16 @@ def fused_transition(x, ln_scale, ln_offset, w1, b1, w2, b2, keep=None, *, eps=1
   """
   c = x.shape[-1]
   hdim = w1.shape[1]
-  # swept on sm_120 and gfx1151: the fp32 [block_m, C] accumulator lives in registers
-  wide, rocm = c > 128, is_rocm()
-  block_m = block_m or (64 if wide or rocm else 128)
-  chunk = chunk or (64 if wide else 32)
-  num_warps = num_warps or (8 if wide else 4)
-  num_stages = num_stages or (1 if wide or rocm else 2)
-  assert supported(c, hdim), (c, hdim)
   xf = x.reshape(-1, c)
   m = xf.shape[0]
+  # swept on sm_120 and gfx1151: the fp32 [block_m, C] accumulator lives in registers
+  wide, rocm = c > 128, is_rocm()
+  sm80_128 = not rocm and compute_capability() == 80 and c == 128 and hdim % 128 == 0 and m <= 300_000
+  block_m = block_m or (64 if wide or rocm else 128)
+  chunk = chunk or (64 if wide else 128 if sm80_128 else 32)
+  num_warps = num_warps or (8 if wide or sm80_128 else 4)
+  num_stages = num_stages or (1 if wide or rocm or sm80_128 else 2)
+  assert c & (c - 1) == 0 and 16 <= c <= 256 and hdim % 64 == 0, (c, hdim)
   vec = lambda n: pl.BlockSpec((n,), lambda i: (0,))
   out = pl.pallas_call(
       functools.partial(_kernel, eps=eps, m=m, block_m=block_m, chunk=chunk, add_input=add_input),

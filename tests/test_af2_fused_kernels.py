@@ -57,6 +57,9 @@ for tag, cfg, adt in configs:
     ref = lambda p, bias, kmask, gb: ref_packed_attention(p, bias, kmask, gb, sm_scale=D ** -.5, column=column)
     check(f"{tag} packed_attention {X}x{Y} {H}x{D} {'col' if column else 'row'}{' gated' if gated else ''}",
           call, ref, (p, bias, kmask, gb), [0, 1] + ([3] if gated else []))
+    if tag != "sm70" and tag != "sm75" and (X, Y) in ((96, 64), (50, 50)):
+      check(f"{tag} packed_attention {X}x{Y} {H}x{D} {'col' if column else 'row'}{' gated' if gated else ''} no bias",
+            call, ref, (p, None, kmask, gb), [0] + ([3] if gated else []))
 
 # tiny row counts leave only a partial block
 for M, C, F in ((4096, 128, 4), (777, 64, 4), (1000, 256, 4), (300, 64, 2), (1, 128, 4), (64, 128, 4), (127, 128, 4)):

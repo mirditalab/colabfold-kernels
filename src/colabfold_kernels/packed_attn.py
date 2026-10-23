@@ -18,6 +18,7 @@ from jax.experimental.pallas import triton as plgpu
 from colabfold_kernels.device import compute_capability, is_rocm, l2_cache_size
 from colabfold_kernels.transition import ln_rows, ref_ln, unless_padding
 from colabfold_kernels.tri_flash import LOG2E, NEG, _chunks, _kernel, _pow2_tile, e4m3, fp8_supported
+from colabfold_kernels.tri_mul import pallas_layer_norm
 
 _dot = functools.partial(jnp.dot, preferred_element_type=jnp.float32)
 
@@ -26,7 +27,7 @@ _dot = functools.partial(jnp.dot, preferred_element_type=jnp.float32)
     "sm_scale", "column", "block_q", "block_k", "num_warps", "num_stages", "half", "out_dtype", "group", "trim"))
 def packed_attention(p, bias, kmask, gate_bias=None, kv=None, *, sm_scale, column=False, block_q=None,
                      block_k=None, num_warps=4, num_stages=None, half=None, out_dtype=None, group=None, trim=False):
-  """p [X, Y, G, H, D] (G = 3, or 4 with a gate); bias [H, Sq, Sk]; kmask [batch, Sk] bool;
+  """p [X, Y, G, H, D] (G = 3, or 4 with a gate); bias [H, Sq, Sk] or None; kmask [batch, Sk] bool;
   gate_bias [H, D] when G == 4. Rows: batch X, sequence Y; column: batch Y, sequence X.
   kv [X, Y, 2, H, D], the k and v slots in e4m3, leaves p with q and the gate: both dots then run e4m3.
   half: the softmax in f16, by default when p is f16 (a bf16 p's conversion in the kernel costs what it saves).
@@ -44,11 +45,12 @@ def packed_attention(p, bias, kmask, gate_bias=None, kv=None, *, sm_scale, colum
   nb, s = (Y, X) if column else (X, Y)
   chunks = _chunks(D)
   dk = chunks[-1][0] + chunks[-1][1]
+  biased = bias is not None
   # swept on sm_120 at the triangle and MSA shapes: 12-17% over block_q=64; half on the A100: rows 64 x 64, 1.2-1.4x
-  # over 128 x 32 (fewer registers, more warps a scheduler), columns as they were
+  # over 128 x 32 (fewer registers, more warps a scheduler), columns as they were when biased, 128 x 64 when unbiased
   # ROCm, swept for both softmaxes, rows and columns: 128 x 64 and one stage
   block_q = block_q or (128 if rocm else 64 if half and not column else 128)
-  block_k = block_k or (64 if rocm or (half and not column) else _pow2_tile(min(32, D)))
+  block_k = block_k or (64 if rocm or (half and (not column or not biased)) else _pow2_tile(min(32, D)))
   fp8 = kv is not None
   assert not fp8 or fp8_supported(D, block_k), (D, block_k)
   num_stages = num_stages or (1 if rocm else 3 if column else 2)
@@ -59,7 +61,7 @@ def packed_attention(p, bias, kmask, gate_bias=None, kv=None, *, sm_scale, colum
   if group is None:
     # grouping pays once the bias outgrows half the L2, and costs while it fits; 20 MB where jax cannot tell the L2.
     # ROCm (jax reports no L2): 8 once the bias outgrows the last-level cache, and none while the cache holds it
-    bias_bytes = H * s * s * 2
+    bias_bytes = H * s * s * 2 if biased else 0
     group = (8 if bias_bytes > 64 << 20 else 0) if rocm else 16 if bias_bytes >= (l2_cache_size() or 40 << 20) // 2 else 0
   if group:
     grid = (group * nq, H, pl.cdiv(nb, group))
@@ -80,17 +82,20 @@ def packed_attention(p, bias, kmask, gate_bias=None, kv=None, *, sm_scale, colum
   # tri_flash's kernel: the BlockSpecs pick q/k/v/gate out of p, the kernel never sees the packing
   # the array and slot each of k, v and the gate is read from
   (ka, ks), (va, vs), gs = ((p, 1), (p, 2), 3) if kv is None else ((kv, 0), (kv, 1), 1)
-  # every batch re-reads the bias, most of the kernel's L2 traffic: rows padded to 128 bytes keep a key block's
-  # slice of it from straddling one more 32-byte sector (1,048 keys: 15% slower unpadded)
-  sp = -(-s // 64) * 64
+  in_specs, args = [q_spec(0), kv_spec(ks), kv_spec(vs)], [p, ka, va]
   # half: the bias in f16 in the log2 domain, negated (the kernel subtracts it); ROCm's bf16 path takes it in log2 too
   log2_bias = rocm and not half and not fp8
-  bias = ((bias.astype(jnp.float32) * -LOG2E).astype(jnp.float16) if half else
-          (bias.astype(jnp.float32) * LOG2E).astype(p.dtype) if log2_bias else bias.astype(p.dtype))
-  bias = jnp.pad(bias, ((0, 0), (0, 0), (0, sp - s)))
-  in_specs = [q_spec(0), kv_spec(ks), kv_spec(vs), pl.BlockSpec((None, block_q, sp), at(lambda i, h, j: (h, i, 0))),
-              pl.BlockSpec((None, s), at(lambda i, h, j: (j, 0)))]
-  args = [p, ka, va, bias, kmask]
+  if biased:
+    # every batch re-reads the bias, most of the kernel's L2 traffic: rows padded to 128 bytes keep a key block's
+    # slice of it from straddling one more 32-byte sector (1,048 keys: 15% slower unpadded)
+    sp = -(-s // 64) * 64
+    bias = ((bias.astype(jnp.float32) * -LOG2E).astype(jnp.float16) if half else
+            (bias.astype(jnp.float32) * LOG2E).astype(p.dtype) if log2_bias else bias.astype(p.dtype))
+    bias = jnp.pad(bias, ((0, 0), (0, 0), (0, sp - s)))
+    in_specs.append(pl.BlockSpec((None, block_q, sp), at(lambda i, h, j: (h, i, 0))))
+    args.append(bias)
+  in_specs.append(pl.BlockSpec((None, s), at(lambda i, h, j: (j, 0))))
+  args.append(kmask)
   # leading key blocks with no masked key skip the mask (ColabFold masks padding only): -25% loop instructions on sm_80
   lead = jnp.where(kmask.all(axis=1), s, jnp.argmin(kmask, axis=1))
   in_specs.append(pl.BlockSpec((1,), at(lambda i, h, j: (j,))))
@@ -105,7 +110,7 @@ def packed_attention(p, bias, kmask, gate_bias=None, kv=None, *, sm_scale, colum
   return pl.pallas_call(
       functools.partial(_kernel, sm_scale=sm_scale, block_q=block_q, block_k=block_k, sq=s, d=D,
                         chunks=chunks, gated=gated, fp8=fp8, prefix=True, half=half, group=group or 1, trim=trim,
-                        log2_bias=log2_bias),
+                        log2_bias=log2_bias, biased=biased),
       grid=grid,
       in_specs=in_specs,
       out_specs=o_spec,
@@ -144,7 +149,9 @@ def ref_packed_attention(p, bias, kmask, gate_bias=None, kv=None, *, sm_scale, c
   if column:
     p = jnp.swapaxes(p, 0, 1)
   q, k, v = p[:, :, 0], p[:, :, 1], p[:, :, 2]
-  logits = jnp.einsum('bqhd,bkhd->bhqk', q, k) * sm_scale + bias.astype(jnp.float32)[None]
+  logits = jnp.einsum('bqhd,bkhd->bhqk', q, k) * sm_scale
+  if bias is not None:
+    logits = logits + bias.astype(jnp.float32)[None]
   logits = jnp.where(kmask[:, None, None, :], logits, NEG)
   o = jnp.einsum('bhqk,bkhd->bqhd', jax.nn.softmax(logits, axis=-1), v)
   if gate_bias is not None:
@@ -161,7 +168,8 @@ def attention_via(p, bias, kmask, gate_bias=None, kv=None, *, sm_scale, column=F
   pp = jnp.swapaxes(p, 0, 1) if column else p
   q, k, v = (jnp.swapaxes(pp[:, :, i], 1, 2) for i in range(3))
   mask_bias = jnp.where(kmask, 0., -1e9).astype(p.dtype)[:, None, None, :]
-  o = jnp.swapaxes(attention(q, k, v, mask_bias, bias.astype(p.dtype), sm_scale), 1, 2)
+  b = None if bias is None else bias.astype(p.dtype)
+  o = jnp.swapaxes(attention(q, k, v, mask_bias, b, sm_scale), 1, 2)
   if gate_bias is not None:
     o = (o.astype(jnp.float32) * jax.nn.sigmoid(pp[:, :, 3].astype(jnp.float32)
                                                + gate_bias.astype(jnp.float32))).astype(p.dtype)
@@ -180,7 +188,7 @@ def ln_projection_supported(a, n=None):
 
 
 def _ln_proj_kernel(x_ref, s_ref, offset_ref, *refs, eps, m, block_m, slots, heads, f8_slots, f8_scales, keep):
-  # refs: w [slots, a, n] if slots, wb [heads, a] if heads, keep [block_m] if keep, then the outputs in the same order,
+  # refs: w [slots, a, n] if slots, wb [a, heads] if heads, keep [block_m] if keep, then the outputs in the same order,
   # the e4m3 one last
   refs = list(refs)
   w_ref = refs.pop(0) if slots else None
@@ -190,6 +198,7 @@ def _ln_proj_kernel(x_ref, s_ref, offset_ref, *refs, eps, m, block_m, slots, hea
   b_ref = refs.pop(0) if heads else None
   p8_ref = refs.pop(0) if f8_slots else None
   rows = (pl.program_id(0) * block_m + jnp.arange(block_m)) < m
+  hm = (jnp.arange(b_ref.shape[0]) < heads) if heads else None
   outs = [r for r in (p_ref, p8_ref) if r is not None]
 
   def compute():
@@ -208,16 +217,16 @@ def _ln_proj_kernel(x_ref, s_ref, offset_ref, *refs, eps, m, block_m, slots, hea
         else:
           plgpu.store(p_ref.at[:, pl.ds(half.index(g) * n + c0, chunk)], out.astype(p_ref.dtype),
                       mask=rows[:, None])
-    for h in range(heads):
-      # a few heads: row reductions, a dot would pad them to 16 columns
-      b = jnp.sum(y.astype(jnp.float32) * wb_ref[h][None, :].astype(jnp.float32), axis=1)
-      plgpu.store(b_ref.at[h], b.astype(b_ref.dtype), mask=rows)
+    if heads:
+      wbt = plgpu.load(wb_ref, mask=hm[None, :], other=0.0)
+      b = _dot(y, wbt).T
+      plgpu.store(b_ref, b.astype(b_ref.dtype), mask=hm[:, None] & rows[None, :])
 
   def padding():  # rows keep leaves out: zeros
     for o in outs:
       plgpu.store(o, jnp.zeros(o.shape, jnp.float32).astype(o.dtype), mask=rows[:, None])
     if b_ref is not None:
-      plgpu.store(b_ref, jnp.zeros(b_ref.shape, b_ref.dtype), mask=rows[None, :])
+      plgpu.store(b_ref, jnp.zeros(b_ref.shape, b_ref.dtype), mask=hm[:, None] & rows[None, :])
 
   unless_padding(keep_ref, rows, compute, padding)
 
@@ -225,7 +234,7 @@ def _ln_proj_kernel(x_ref, s_ref, offset_ref, *refs, eps, m, block_m, slots, hea
 @functools.partial(jax.jit, static_argnames=("eps", "block_m", "num_warps", "num_stages", "f8_slots", "f8_scales",
                                              "p_dtype"))
 def ln_projection(x, ln_scale, ln_offset, w=None, wb=None, keep=None, *, eps=1e-5, block_m=None, num_warps=None,
-                  num_stages=2, f8_slots=(), f8_scales=None, p_dtype=None):
+                  num_stages=None, f8_slots=(), f8_scales=None, p_dtype=None):
   """LN(x) projected by each slot of w and by wb, from one read of x [M, a].
 
   w [G, a, n] gives p [M, G*n], the packed projection; wb [a, h] gives the bias channel-major [h, M].
@@ -237,13 +246,20 @@ def ln_projection(x, ln_scale, ln_offset, w=None, wb=None, keep=None, *, eps=1e-
   """
   f8_scales = f8_scales or (1.0,) * len(f8_slots)
   m, a = x.shape
-  # swept on the L40S at the triangle attention's 4 x 128 outputs: 30% over 64 rows x 4 warps; on the A100 64 x 4 is
-  # 1.6-1.8x over that up to 128 channels, 32 x 4 1.15x at 256 (where 64 x 4 is 2.4x slower); on sm_120 at 128 channels
+  cc = compute_capability()
+  if (cc == 80 and a == 256 and w is not None and wb is None and not f8_slots and keep is None
+      and block_m is None and num_warps is None and num_stages is None):
+    # on an A100 at 256 channels, 32-row blocks stream 512 KB of weights each (2.16 GB at 512x264); writing the
+    # normed rows directly in p_dtype (f16 for half_attention) lets cuBLAS run one native GEMM with no conversion pass
+    dt = p_dtype or x.dtype
+    y = pallas_layer_norm(x, ln_scale, ln_offset, eps=eps, out_dtype=dt)
+    return jnp.dot(y, jnp.moveaxis(w.astype(dt), 0, 1).reshape(a, -1)), None
+  # swept on the L40S at the triangle attention's 4 x 128 outputs: 30% over 64 rows x 4 warps; on the A100 128 x 8 is
+  # 1.15-2.08x over 64 x 4 up to 128 channels, 32 x 4 1.15x at 256 (where 64 x 4 is 2.4x slower); on sm_120 at 128 channels
   # 64 x 8 is 1.39x over 32 x 8 at 1,024 tokens (1.45 -> 1.04 ms) and 1.37x at 512 (weights re-read from L2 per block)
   if block_m is None or num_warps is None:
-    cc = compute_capability()
     if cc == 80 and a <= 128:
-      m_, w_ = 64, 4
+      m_, w_ = 128, 8
     elif cc == 80:
       m_, w_ = 32, 4
     elif cc is not None and 120 <= cc < 130 and a <= 128:
@@ -251,6 +267,7 @@ def ln_projection(x, ln_scale, ln_offset, w=None, wb=None, keep=None, *, eps=1e-
     else:
       m_, w_ = 32, 8
     block_m, num_warps = block_m or m_, num_warps or w_
+  num_stages = num_stages or (1 if cc == 80 and a <= 128 else 2)
   slots = 0 if w is None else w.shape[0]
   heads = 0 if wb is None else wb.shape[1]
   vec = pl.BlockSpec((a,), lambda i: (0,))
@@ -262,9 +279,10 @@ def ln_projection(x, ln_scale, ln_offset, w=None, wb=None, keep=None, *, eps=1e-
     out_specs.append(pl.BlockSpec((block_m, (slots - len(f8_slots)) * n), lambda i: (i, 0)))
     out_shape.append(jax.ShapeDtypeStruct((m, (slots - len(f8_slots)) * n), p_dtype or x.dtype))
   if heads:
-    in_specs.append(pl.BlockSpec((heads, a), lambda i: (0, 0)))
-    args.append(wb.T)
-    out_specs.append(pl.BlockSpec((heads, block_m), lambda i: (0, i)))
+    bh = max(16, 1 << (heads - 1).bit_length())
+    in_specs.append(pl.BlockSpec((a, bh), lambda i: (0, 0)))
+    args.append(wb)
+    out_specs.append(pl.BlockSpec((bh, block_m), lambda i: (0, i)))
     out_shape.append(jax.ShapeDtypeStruct((heads, m), x.dtype))
   if keep is not None:
     in_specs.append(pl.BlockSpec((block_m,), lambda i: (i,)))
@@ -332,7 +350,7 @@ def output_projection_supported(k, c):
 
 
 @functools.partial(jax.jit, static_argnames=("block_m", "num_warps", "num_stages"))
-def output_projection(o, w, b, residual=None, keep=None, *, block_m=64, num_warps=None, num_stages=2):
+def output_projection(o, w, b, residual=None, keep=None, *, block_m=None, num_warps=None, num_stages=None):
   """o [M, k] @ w [k, c] + b, plus residual [M, c] when given, in one pass.
 
   The result has residual's dtype, else o's, and aliases the residual. keep [M]: the rows that matter; a row block
@@ -341,7 +359,11 @@ def output_projection(o, w, b, residual=None, keep=None, *, block_m=64, num_warp
   m, k = o.shape
   c = w.shape[1]
   block_k = min(k, 64)
+  cc = compute_capability()
+  wide_m = cc == 80 and c == 256 and m >= 4096
+  block_m = block_m or (128 if wide_m else 64)
   num_warps = num_warps or (8 if c > 128 else 4)
+  num_stages = num_stages or (3 if wide_m else 2)
   rows = pl.BlockSpec((block_m, c), lambda i: (i, 0))
   extra = [] if residual is None else [residual]
   specs = [rows] * len(extra)

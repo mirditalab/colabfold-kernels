@@ -489,9 +489,9 @@ def _ln_kernel(x_ref, scale_ref, offset_ref, o_ref, *, eps, m, c, block_m):
 _TILE_BYTES = 32 * 1024
 
 
-@functools.partial(jax.jit, static_argnames=("eps", "block_m"))
-def pallas_layer_norm(x, scale, offset, *, eps=1e-5, block_m=64):
-  # x [..., c]; normalize over last axis; scale/offset [c]. Returns x's shape/dtype.
+@functools.partial(jax.jit, static_argnames=("eps", "block_m", "out_dtype"))
+def pallas_layer_norm(x, scale, offset, *, eps=1e-5, block_m=64, out_dtype=None):
+  # x [..., c]; normalize over last axis; scale/offset [c]. Returns x's shape, in out_dtype or x's dtype.
   c = x.shape[-1]
   bc = max(16, 1 << (c - 1).bit_length())        # Triton tiles are powers of two
   xf = x.reshape(-1, c)
@@ -505,7 +505,7 @@ def pallas_layer_norm(x, scale, offset, *, eps=1e-5, block_m=64):
                 pl.BlockSpec((bc,), lambda i: (0,)),
                 pl.BlockSpec((bc,), lambda i: (0,))],
       out_specs=pl.BlockSpec((block_m, bc), lambda i: (i, 0)),
-      out_shape=jax.ShapeDtypeStruct((m, c), x.dtype),
+      out_shape=jax.ShapeDtypeStruct((m, c), out_dtype or x.dtype),
       compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=2),
       name="pallas_layer_norm",
   )(xf, scale, offset)

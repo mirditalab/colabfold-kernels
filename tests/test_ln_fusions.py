@@ -115,6 +115,14 @@ for b, rows in ((59, 1), (259, 1), (259, 16)):
   check(f"opm_update b={b} rows={rows}", up, opm.ref_opm_update, [lhs, t, ob, norm, f(b, b, 128)], [0, 1, 4])
   check(f"opm_update b={b} rows={rows} no residual", up, opm.ref_opm_update, [lhs, t, ob, norm], [0, 1])
 assert fused_ops.opm_update(gc, dt, 48, 128) is None and fused_ops.opm_update(gc, dt, 32, 96) is None
+for rows, b, c, k in ((1, 59, 128, 32), (16, 259, 256, 32)):
+  x, sc, of = f(rows, b, c, s=2.), f32(c), f32(c)
+  lw, lb, rw, rb = f(c, k, s=.1), f(k, s=.1), f(c, k, s=.1), f(k, s=.1)
+  mask = jnp.asarray((rng.uniform(size=(rows, b)) > .1).astype(np.float32), dt)
+  check(f"opm_projection rows={rows} b={b} c={c} k={k}",
+        fused_ops.opm_projection(gc, dt, c, k), opm.ref_opm_projection,
+        [x, sc, of, lw, lb, rw, rb, mask], [0, 1, 3, 5])
+assert fused_ops.opm_projection(gc, dt, 256, 48) is None and fused_ops.opm_projection(gc, dt, 192, 32) is None
 
 # the unfused path is exactly what the fused one replaces: LN, then the existing kernels
 m = 4101
