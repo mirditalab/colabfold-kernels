@@ -127,8 +127,13 @@ def _mgpu_attn():
 def _mosaic_or_triton(p, bias, kmask, gate_bias=None, p8=None, *, sm_scale, column=False, out_dtype=None, trim=False):
   """The Mosaic GPU kernel where it runs, else Triton's. p8 holds the e4m3 slots fp8_attention chose for that kernel."""
   from colabfold_kernels import packed_attn as pa
-  # without a bias Triton's kernel is the faster one at an MSA's depth: Mosaic GPU's overlaps the bias it no longer reads
-  if bias is not None and _mosaic_runs(p.shape[-1], p.dtype, p.shape[0 if column else 1]):
+  # without a bias Triton's kernel is the faster one at an MSA's depth: Mosaic GPU's overlaps the bias it no longer
+  # reads; e4m3 slots fp8_attention_slots chose for Mosaic GPU stay there, on a zero bias
+  s = p.shape[0 if column else 1]
+  if (bias is not None or p8 is not None) and _mosaic_runs(p.shape[-1], p.dtype, s):
+    if bias is None:
+      import jax.numpy as jnp
+      bias = jnp.zeros((p.shape[3], s, s), p.dtype)
     return _mgpu_attn().packed_attention(p, bias, kmask, gate_bias, p8, sm_scale=sm_scale, column=column, trim=trim)
   return pa.packed_attention(p, bias, kmask, gate_bias, p8, sm_scale=sm_scale, column=column, out_dtype=out_dtype,
                              trim=trim)
