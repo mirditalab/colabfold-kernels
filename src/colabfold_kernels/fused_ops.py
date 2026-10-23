@@ -101,7 +101,7 @@ def _mgpu_attn():
 def _mosaic_or_triton(p, bias, kmask, gate_bias=None, p8=None, *, sm_scale, column=False, out_dtype=None, trim=False):
   """The Mosaic GPU kernel where it runs, else Triton's. p8 holds the e4m3 slots fp8_attention chose for that kernel."""
   from colabfold_kernels import packed_attn as pa
-  if _mosaic_runs(p.shape[-1], p.dtype, p.shape[0 if column else 1]):
+  if bias is not None and _mosaic_runs(p.shape[-1], p.dtype, p.shape[0 if column else 1]):
     return _mgpu_attn().packed_attention(p, bias, kmask, gate_bias, p8, sm_scale=sm_scale, column=column, trim=trim)
   return pa.packed_attention(p, bias, kmask, gate_bias, p8, sm_scale=sm_scale, column=column, out_dtype=out_dtype,
                              trim=trim)
@@ -233,14 +233,25 @@ def ln_projection(global_config, dtype, num_channel, num_output=None):
 
 
 def output_projection(global_config, dtype, num_input, num_output):
-  """-> f(o, w, b, residual=None) or None: the attention output projection with its residual update."""
+  """-> f(o, w, b, residual=None, keep=None, ln_scale=None, ln_offset=None, *, eps, ln_dtype) or None."""
   if not _pallas_half(global_config, dtype):
     return None
   from colabfold_kernels.grads import differentiable_via
   from colabfold_kernels import packed_attn as pa
   if not pa.output_projection_supported(num_input, num_output):
     return None
-  return differentiable_via(pa.output_projection, pa.ref_output_projection)
+  return differentiable_via(pa.output_projection, pa.ref_output_projection, nondiff=('eps', 'ln_dtype'))
+
+
+def global_attention(global_config, dtype, num_channel, num_head, key_dim, value_dim, num_output=None):
+  """-> f(x, mask, ln_scale, ln_offset, qw, kw, vw, gw, gb, ow, ob, *residual, eps, add_input) or None."""
+  if not _pallas_half(global_config, dtype) or key_dim != value_dim:
+    return None
+  from colabfold_kernels.grads import differentiable_via
+  from colabfold_kernels import packed_attn as pa
+  if not pa.global_attention_supported(num_channel, num_head, key_dim, num_output or num_channel):
+    return None
+  return differentiable_via(pa.global_attention, pa.ref_global_attention, nondiff=('eps', 'add_input'))
 
 
 def opm_update(global_config, dtype, num_inner, num_output):
@@ -252,6 +263,17 @@ def opm_update(global_config, dtype, num_inner, num_output):
   if not opm.supported(num_inner, num_output):
     return None
   return differentiable_via(opm.opm_update, opm.ref_opm_update, nondiff=('eps',))
+
+
+def opm_projection(global_config, dtype, num_channel, num_outer):
+  """-> f(x, ln_scale, ln_offset, lw, lb, rw, rb, mask, *, eps) -> (left_act, right_act) or None."""
+  if not _pallas_half(global_config, dtype):
+    return None
+  from colabfold_kernels.grads import differentiable_via
+  from colabfold_kernels import opm
+  if not opm.proj_supported(num_channel, num_outer):
+    return None
+  return differentiable_via(opm.opm_projection, opm.ref_opm_projection, nondiff=('eps',))
 
 
 def layer_norm(global_config, dtype):
