@@ -108,6 +108,8 @@ def opm_update(lhs, t, bias, norm, residual=None, *, eps=1e-3, block_m=64, num_w
                + [rows] * len(extra),
       out_specs=rows,
       out_shape=jax.ShapeDtypeStruct((B, D, F), lhs.dtype if residual is None else residual.dtype),
+      # in place, as the pair's later updates: XLA would copy their fresh buffer back into a loop's carried pair
+      input_output_aliases={} if residual is None else {4: 0},
       compiler_params=plgpu.CompilerParams(num_warps=num_warps, num_stages=num_stages),
       name="opm_update",
   )(lhs, t, bias, norm, *extra)
