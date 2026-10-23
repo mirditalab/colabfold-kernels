@@ -438,19 +438,21 @@ def volta_transition(x, ln_scale, ln_offset, w1, b1, w2, b2, keep=None, *, eps=1
 
 
 @functools.partial(jax.jit, static_argnames=("sym", "eps"))
-def _opm_update_call(lhs, t, bias, norm, residual, *, sym, eps):
+def _opm_update_call(lhs, t, bias, norm, residual, keep, *, sym, eps):
     res = jnp.zeros((1,), jnp.float16) if residual is None else f16(residual)
+    keep, has_keep = _keep(None if residual is None else keep, norm.size)
     out = jax.ShapeDtypeStruct((lhs.shape[0],) + t.shape[1:], jnp.float16)
-    # the output aliases the residual
+    # the output aliases the residual: a block keep skips holds it already
     return jax.ffi.ffi_call(sym, out, vmap_method="sequential",
                             input_output_aliases={} if residual is None else {4: 0})(
-        f16(lhs), f16(t), f32(bias), f32(norm), res, eps=np.float32(eps), has_residual=residual is not None)
+        f16(lhs), f16(t), f32(bias), f32(norm), res, keep, eps=np.float32(eps), has_residual=residual is not None,
+        has_keep=has_keep)
 
 
-def volta_opm_update(lhs, t, bias, norm, residual=None, *, eps=1e-3, cc):
+def volta_opm_update(lhs, t, bias, norm, residual=None, keep=None, *, eps=1e-3, cc):
     """opm.opm_update for sm_70/75: (lhs [B, K] . t [K, D, F] + bias) / (eps + norm [B, D]) (+ residual) in one pass,
-    residual's dtype, else lhs's."""
-    out = _opm_update_call(lhs, t, bias, norm, residual, sym=_fused_symbol("VoltaOpmUpdate", cc), eps=eps)
+    residual's dtype, else lhs's. keep [B, D], with the residual: a block it leaves out keeps the residual."""
+    out = _opm_update_call(lhs, t, bias, norm, residual, keep, sym=_fused_symbol("VoltaOpmUpdate", cc), eps=eps)
     return out.astype(lhs.dtype if residual is None else residual.dtype)
 
 
@@ -468,3 +470,4 @@ def volta_opm_outer(left, right, w, *, cc):
         from colabfold_kernels.opm import ref_opm_outer
         return ref_opm_outer(left, right, w).astype(left.dtype)
     return _opm_outer_call(left, right, w, sym=_fused_symbol("VoltaOpmOuter", cc)).astype(left.dtype)
+

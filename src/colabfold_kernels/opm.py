@@ -13,7 +13,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
 from colabfold_kernels.device import is_rocm
-from colabfold_kernels.transition import ln_rows, ref_ln
+from colabfold_kernels.transition import ln_rows, ref_ln, unless_padding
 
 _dot = functools.partial(jnp.dot, preferred_element_type=jnp.float32)
 
@@ -66,9 +66,16 @@ def ref_opm_projection(x, ln_scale, ln_offset, lw, lb, rw, rb, mask, *, eps=1e-5
           mv * (y @ rw.astype(jnp.float32) + rb.astype(jnp.float32)))
 
 
-def _kernel(a_ref, t_ref, b_ref, n_ref, *rest, m, block_m, block_k, eps):
-  r_ref, o_ref = rest if len(rest) == 2 else (None, rest[0])
+def _kernel(a_ref, t_ref, b_ref, n_ref, *rest, m, block_m, block_k, eps, keep):
+  r_ref, k_ref, o_ref = (rest[0], rest[1] if keep else None, rest[-1]) if len(rest) > 1 else (None, None, rest[0])
   rows = (pl.program_id(0) * block_m + jnp.arange(block_m)) < m
+  # a block keep leaves out (the bucket's padding) keeps the residual, which the aliased output holds
+  unless_padding(k_ref, rows, functools.partial(_update, a_ref, t_ref, b_ref, n_ref, r_ref, o_ref, rows, block_k, eps),
+                 lambda: None, other=0)
+
+
+def _update(a_ref, t_ref, b_ref, n_ref, r_ref, o_ref, rows, block_k, eps):
+  block_m = rows.shape[0]
 
   def body(k, acc):
     ks = pl.ds(pl.multiple_of(k * block_k, block_k), block_k)
@@ -89,8 +96,9 @@ def supported(k, f):
 
 
 @functools.partial(jax.jit, static_argnames=("eps", "block_m", "num_warps", "num_stages"))
-def opm_update(lhs, t, bias, norm, residual=None, *, eps=1e-3, block_m=64, num_warps=4, num_stages=2):
-  """lhs [B, K]; t [K, D, F]; bias [F]; norm [B, D]; residual [B, D, F].
+def opm_update(lhs, t, bias, norm, residual=None, keep=None, *, eps=1e-3, block_m=64, num_warps=4, num_stages=2):
+  """lhs [B, K]; t [K, D, F]; bias [F]; norm [B, D]; residual [B, D, F]; keep [B, D] with the residual: a block it
+  leaves out (all zero, the bucket's padding) keeps the residual without the work.
 
   Returns [B, D, F], residual's dtype, else lhs's.
   """
@@ -99,23 +107,24 @@ def opm_update(lhs, t, bias, norm, residual=None, *, eps=1e-3, block_m=64, num_w
   block_k = 64 if K % 64 == 0 else 32
   rows = pl.BlockSpec((block_m, None, F), lambda i, d: (i, d, 0))
   extra = [] if residual is None else [residual]
+  keeps = [] if residual is None or keep is None else [keep]
   # d innermost: a block of lhs is reused across the row of pair blocks, and all of t stays in L2
   return pl.pallas_call(
-      functools.partial(_kernel, m=B, block_m=block_m, block_k=block_k, eps=eps),
+      functools.partial(_kernel, m=B, block_m=block_m, block_k=block_k, eps=eps, keep=bool(keeps)),
       grid=(pl.cdiv(B, block_m), D),
       in_specs=[pl.BlockSpec((block_m, K), lambda i, d: (i, 0)), pl.BlockSpec((K, None, F), lambda i, d: (0, d, 0)),
                 pl.BlockSpec((F,), lambda i, d: (0,)), pl.BlockSpec((block_m, None), lambda i, d: (i, d))]
-               + [rows] * len(extra),
+               + [rows] * len(extra) + [pl.BlockSpec((block_m, None), lambda i, d: (i, d))] * len(keeps),
       out_specs=rows,
       out_shape=jax.ShapeDtypeStruct((B, D, F), lhs.dtype if residual is None else residual.dtype),
       # in place, as the pair's later updates: XLA would copy their fresh buffer back into a loop's carried pair
       input_output_aliases={} if residual is None else {4: 0},
       compiler_params=plgpu.CompilerParams(num_warps=num_warps, num_stages=num_stages),
       name="opm_update",
-  )(lhs, t, bias, norm, *extra)
+  )(lhs, t, bias, norm, *extra, *keeps)
 
 
-def ref_opm_update(lhs, t, bias, norm, residual=None, *, eps=1e-3):
+def ref_opm_update(lhs, t, bias, norm, residual=None, keep=None, *, eps=1e-3):
   out = jnp.einsum('bk,kdf->bdf', lhs.astype(jnp.float32), t.astype(jnp.float32)) + bias.astype(jnp.float32)
   out = out / (eps + norm.astype(jnp.float32))[..., None]
   return out if residual is None else out + residual.astype(jnp.float32)
