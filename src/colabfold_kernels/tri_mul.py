@@ -311,7 +311,10 @@ def _epilogue_kernel(x_ref, a_ref, s_ref, o_ref_ln, wo_ref, bo_ref, wg_ref, bg_r
   o_ref, = rest
   # x_ref [C, block_m] channel-major triangle product; a_ref [block_m, Ca] normed input
   rows = (pl.program_id(0) * block_m + jnp.arange(block_m)) < m
-  refs = (x_ref, a_ref, s_ref, o_ref_ln, wo_ref, bo_ref, wg_ref, bg_ref, as_ref, ao_ref, r_ref, o_ref, rows, eps)
+  # the product read as zeros where keep leaves a row out: a contraction over the live length does not write it
+  xrows = rows if keep_ref is None else rows & (plgpu.load(keep_ref, mask=rows, other=0) > 0)
+  refs = (x_ref, a_ref, s_ref, o_ref_ln, wo_ref, bo_ref, wg_ref, bg_ref, as_ref, ao_ref, r_ref, o_ref, rows, xrows,
+          eps)
   compute = (functools.partial(_epilogue_rows, *refs, input_ln, add_input) if chunk is None
              else functools.partial(_epilogue_stream_rows, *refs, chunk, input_ln, add_input))
 
@@ -323,8 +326,8 @@ def _epilogue_kernel(x_ref, a_ref, s_ref, o_ref_ln, wo_ref, bo_ref, wg_ref, bg_r
 
 
 def _epilogue_rows(x_ref, a_ref, s_ref, o_ref_ln, wo_ref, bo_ref, wg_ref, bg_ref, as_ref, ao_ref, r_ref, o_ref, rows,
-                   eps, input_ln, add_input):
-  x = plgpu.load(x_ref, mask=rows[None, :], other=0.0).astype(jnp.float32).T
+                   xrows, eps, input_ln, add_input):
+  x = plgpu.load(x_ref, mask=xrows[None, :], other=0.0).astype(jnp.float32).T
   y = ln_rows(x, s_ref, o_ref_ln, eps)
   out = _dot(y.astype(wo_ref.dtype), wo_ref[...]) + bo_ref[...][None, :].astype(jnp.float32)
   a = plgpu.load(a_ref, mask=rows[:, None], other=0.0)
@@ -341,9 +344,9 @@ def _epilogue_rows(x_ref, a_ref, s_ref, o_ref_ln, wo_ref, bo_ref, wg_ref, bg_ref
 
 
 def _epilogue_stream_rows(x_ref, a_ref, s_ref, o_ref_ln, wo_ref, bo_ref, wg_ref, bg_ref, as_ref, ao_ref, r_ref, o_ref,
-                          rows, eps, chunk, input_ln, add_input):
+                          rows, xrows, eps, chunk, input_ln, add_input):
   # _epilogue_rows for widths whose whole weights do not fit: the normed rows stay, the output columns stream
-  x = plgpu.load(x_ref, mask=rows[None, :], other=0.0).astype(jnp.float32).T
+  x = plgpu.load(x_ref, mask=xrows[None, :], other=0.0).astype(jnp.float32).T
   y = ln_rows(x, s_ref, o_ref_ln, eps).astype(wo_ref.dtype)
   a = plgpu.load(a_ref, mask=rows[:, None], other=0.0)
   if input_ln:

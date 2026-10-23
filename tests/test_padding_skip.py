@@ -100,9 +100,11 @@ for S, n in [(256, 256), (256, 200), (256, 129), (192, 65)]:
     tri = f(ci, m)
     g = (sc, of, f(ci, s=.1) + 1, f(ci, s=.1), f(ci, c, s=.1), f(c, s=.1), f(c, c, s=.1), f(c, s=.1))
     for add_input in (False, True):
+      # the product reads as zeros where keep leaves a row out (a live contraction does not write it)
       check_keep(f"trimul_epilogue_ln {ci} add_input={add_input} S={S} n={n}",
                  [tm.trimul_epilogue_ln(tri, x, *g, keep, add_input=add_input)],
-                 [tm.trimul_epilogue_ln(tri, x, *g, add_input=add_input)], keep, [x if add_input else zero])
+                 [tm.trimul_epilogue_ln(jnp.where(keep > 0, tri, 0), x, *g, add_input=add_input)], keep,
+                 [x if add_input else zero])
   wa, wb2, wo2 = f(c, 4 * c, s=.1), f(c, 4 * c, s=.1), f(4 * c, c, s=.1)
   w1, b1, w2, b2 = f(c, 4 * c, s=.1), f(4 * c, s=.1), f(4 * c, c, s=.1), f(c, s=.1)
   for add_input in (False, True):
