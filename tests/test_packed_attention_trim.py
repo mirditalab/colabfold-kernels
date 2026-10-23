@@ -1,7 +1,8 @@
 """packed attention's trim: on a padded pair (tokens past n masked), the real rows match the untrimmed kernel and the
 padded ones are zero or untrimmed; on a mask with holes, every row the trim does not zero matches. Both the Triton kernel and,
-on sm_12x, the Mosaic GPU one; rows and columns, gated, bf16 and the e4m3 k/v / q/k slots. poison: p NaN past the live
-block rounded to 128, what ln_projection leaves unwritten there; trimmed rows must still come out zero."""
+on sm_12x, the Mosaic GPU one; rows and columns, gated, bf16 and the e4m3 k/v / q/k slots. poison: p and the bias NaN
+past the live block rounded to 64 (the key blocks), what ln_projection leaves unwritten there, so queries past the last
+token read NaN too; trimmed rows must still come out zero."""
 import sys
 
 import jax
@@ -53,10 +54,12 @@ def case(S, n, column, mosaic, fp8, holes=False, poison=False):
       pp = p[:, :, jnp.array([0, 3])]
   f = fused_ops._mgpu_attn().packed_attention if mosaic else pa.packed_attention
   base = f(pp, bias, kmask, gb, *extra, **kw)
+  pb = bias
   if poison:
-    out = jnp.arange(S) >= -(-n // 128) * 128
+    out = jnp.arange(S) >= -(-n // 64) * 64
     pp = jnp.where((out[:, None] | out[None, :])[:, :, None, None, None], jnp.nan, pp).astype(pp.dtype)
-  o = f(pp, bias, kmask, gb, *extra, trim=True, **kw)
+    pb = jnp.where((out[:, None] | out[None, :])[None], jnp.nan, bias).astype(bias.dtype)
+  o = f(pp, pb, kmask, gb, *extra, trim=True, **kw)
   ref = pa.ref_packed_attention(p, bias, kmask, gb, **kw)
   # rows trim keeps: batch rows with a key, and sequence positions before the last token
   last = jnp.max(jnp.where(tok, jnp.arange(S) + 1, 0))

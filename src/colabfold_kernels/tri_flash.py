@@ -93,8 +93,8 @@ def _kernel(q_ref, k_ref, v_ref, *rest,
   # exp2; the row sum p.1 on the tensor cores
   # log2_bias (ROCm's bf16 path): the bias comes times log2(e) and q is scaled once here, one add a score instead of three
   # trim: after the prefix, the row's count of key blocks up to its last unmasked key, and the token count past which
-  # every query is padding; blocks past the first are skipped, a row with no key or a query block past the second
-  # writes zeros (a padded row, which averaged its masked keys before)
+  # every query is padding; blocks past the first are skipped, a row with no key or a query past the second writes
+  # zeros (a padded row, which averaged its masked keys before)
   bias_ref, *rest = rest if biased else (None, *rest)
   kmask_ref, *rest = rest
   pre_ref, *rest = rest if prefix else (None, *rest)
@@ -222,8 +222,8 @@ def _kernel(q_ref, k_ref, v_ref, *rest,
     # log2 domain, which is what the backward's exp2 wants
     plgpu.store(lse_ref, m_i + jnp.log2(l_i), mask=q_valid)
   if trim:
-    # no key ran: zeros, not 0 / 0, nor whatever the gate's unwritten rows hold
-    empty = l_i <= 0
+    # no key ran, or a query past the limit: zeros, not 0 / 0, nor whatever unwritten q, gate or bias rows hold
+    empty = (l_i <= 0) | ((pl.program_id(0) // group * block_q + jnp.arange(block_q)) >= lim_ref[0])
     l_i = jnp.where(empty, jnp.inf, l_i)
   inv_l = (1.0 / l_i)[:, None]
   for oc, (off, w), c in zip(os, chunks, cols):

@@ -194,9 +194,10 @@ def packed_attention(p, bias, kmask, gate_bias=None, qk8=None, *, sm_scale, colu
       else:
         o, _, l = lax.fori_loop(0, nk, step, (o0, m0, l0))
       if trim:
-        # no key ran, or none of this row's (a padded row in a group that has keys): zeros, not 0 / 0 or an average,
-        # selected after the gate, whose unwritten rows may hold anything
-        live = jnp.where((l > 0) & (lims_ref[nbg + 1 + b0 + wg] > 0), 1.0, 0.0)
+        # no key ran, or none of this row's (a padded row in a group that has keys), or a query past the limit: zeros,
+        # not 0 / 0 or an average, selected after the gate, whose unwritten rows may hold anything
+        qpos = plgpu.layout_cast(lax.broadcasted_iota(jnp.int32, (bq,), 0), ACC.reduce(1)) + i * bq
+        live = jnp.where((l > 0) & (lims_ref[nbg + 1 + b0 + wg] > 0) & (qpos < lims_ref[nbg]), 1.0, 0.0)
         l = jnp.where(l > 0, l, jnp.inf)
       o = o / lax.broadcast_in_dim(l, o.shape, [0])
       if gated:
