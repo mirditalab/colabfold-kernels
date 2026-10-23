@@ -319,6 +319,14 @@ def output_projection(global_config, dtype, num_input, num_output):
 
 def opm_update(global_config, dtype, num_inner, num_output):
   """-> f(lhs, t, bias, norm, residual=None, *, eps) or None: the shallow outer product mean's whole pair update."""
+  cc = _legacy_half(global_config, dtype)
+  if cc is not None:
+    from colabfold_kernels.grads import differentiable_via
+    from colabfold_kernels import opm
+    va = _volta()
+    if not (opm.supported(num_inner, num_output) and va.fused_available(cc, 'opm_update')):
+      return None
+    return differentiable_via(functools.partial(va.volta_opm_update, cc=cc), opm.ref_opm_update, nondiff=('eps',))
   if not _pallas_half(global_config, dtype):
     return None
   from colabfold_kernels.grads import differentiable_via
@@ -330,6 +338,14 @@ def opm_update(global_config, dtype, num_inner, num_output):
 
 def opm_outer(global_config, dtype, rows, num_inner, d, num_output):
   """-> f(left, right, w) or None: the outer product mean in AF2's own order on 16 rows, its product never written."""
+  cc = _legacy_half(global_config, dtype)
+  if cc is not None:
+    from colabfold_kernels.grads import differentiable_via
+    from colabfold_kernels import opm
+    va = _volta()
+    if not (va.opm_outer_supported(rows, num_inner, d, num_output) and va.fused_available(cc, 'opm_outer')):
+      return None
+    return differentiable_via(functools.partial(va.volta_opm_outer, cc=cc), opm.ref_opm_outer)
   if not _pallas_half(global_config, dtype):
     return None
   from colabfold_kernels.grads import differentiable_via

@@ -282,7 +282,9 @@ MSA_WIDTHS = FUSED_WIDTHS + (256,)
 _MAX_BIAS_HEADS = 8
 _FUSED_SYMBOLS = {"ln_gated_dual_proj": "VoltaLnGdp", "trimul_epilogue": "VoltaTrimulEpilogue",
                   "ln_projection": "VoltaLnProj", "output_projection": "VoltaOutProj",
-                  "transition": "VoltaTransition"}
+                  "transition": "VoltaTransition", "opm_update": "VoltaOpmUpdate", "opm_outer": "VoltaOpmOuter"}
+# opm_outer stages left this many outer channels at a time.
+_OPM_CHUNK = 16
 # The transition kernel holds the hidden activation in chunks of this many columns.
 _HIDDEN_CHUNK = 64
 
@@ -307,6 +309,11 @@ def projection_supported(*widths):
 def transition_supported(num_channel, num_intermediate):
     """AF2's transitions: factor 4 in the pair and MSA stacks, 2 in the template stack."""
     return num_channel in MSA_WIDTHS and num_intermediate in (2 * num_channel, 4 * num_channel)
+
+
+def opm_outer_supported(rows, num_inner, d, f):
+    """16 rows, AF2's 32 inner channels, D a multiple of 4, F a power of two from 16 to 128."""
+    return rows == 16 and num_inner == 32 and d % 4 == 0 and f & (f - 1) == 0 and 16 <= f <= 128
 
 
 def _keep(keep, m):
@@ -428,3 +435,36 @@ def volta_transition(x, ln_scale, ln_offset, w1, b1, w2, b2, keep=None, *, eps=1
     out = _transition_call(x.reshape(-1, c), ln_scale, ln_offset, w1, b1, w2, b2, keep,
                            sym=_fused_symbol("VoltaTransition", cc), eps=eps, add_input=add_input)
     return out.reshape(x.shape).astype(x.dtype)
+
+
+@functools.partial(jax.jit, static_argnames=("sym", "eps"))
+def _opm_update_call(lhs, t, bias, norm, residual, *, sym, eps):
+    res = jnp.zeros((1,), jnp.float16) if residual is None else f16(residual)
+    out = jax.ShapeDtypeStruct((lhs.shape[0],) + t.shape[1:], jnp.float16)
+    # the output aliases the residual
+    return jax.ffi.ffi_call(sym, out, vmap_method="sequential",
+                            input_output_aliases={} if residual is None else {4: 0})(
+        f16(lhs), f16(t), f32(bias), f32(norm), res, eps=np.float32(eps), has_residual=residual is not None)
+
+
+def volta_opm_update(lhs, t, bias, norm, residual=None, *, eps=1e-3, cc):
+    """opm.opm_update for sm_70/75: (lhs [B, K] . t [K, D, F] + bias) / (eps + norm [B, D]) (+ residual) in one pass,
+    residual's dtype, else lhs's."""
+    out = _opm_update_call(lhs, t, bias, norm, residual, sym=_fused_symbol("VoltaOpmUpdate", cc), eps=eps)
+    return out.astype(lhs.dtype if residual is None else residual.dtype)
+
+
+@functools.partial(jax.jit, static_argnames=("sym",))
+def _opm_outer_call(left, right, w, *, sym):
+    out = jax.ShapeDtypeStruct((left.shape[1], right.shape[1], w.shape[1]), jnp.float16)
+    # the kernel streams w transposed, [F, C*E]
+    return jax.ffi.ffi_call(sym, out, vmap_method="sequential")(f16(left), f16(right), f16(w.T))
+
+
+def volta_opm_outer(left, right, w, *, cc):
+    """opm.opm_outer for sm_70/75: left [16, B, C], right [16, D, E], w [C*E, F] -> [B, D, F], left's dtype, the
+    [B, C*E, D] product never written. Outer channels the kernel does not take run the reference in XLA."""
+    if left.shape[-1] % _OPM_CHUNK:
+        from colabfold_kernels.opm import ref_opm_outer
+        return ref_opm_outer(left, right, w).astype(left.dtype)
+    return _opm_outer_call(left, right, w, sym=_fused_symbol("VoltaOpmOuter", cc)).astype(left.dtype)
