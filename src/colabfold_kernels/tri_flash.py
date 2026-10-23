@@ -11,6 +11,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
 from colabfold_kernels.device import is_rocm
+from colabfold_kernels.transition import sigmoid
 
 # jnp.dot is stable across jax versions, contrary to pl.dot/plgpu.dot
 _dot = functools.partial(jnp.dot, preferred_element_type=jnp.float32)
@@ -49,12 +50,6 @@ def sub_exp2_h(x, m):
                                      constraints="=r,r,r", pack=2,
                                      result_shape_dtypes=[jax.ShapeDtypeStruct(x.shape, jnp.float16)])
   return r
-
-
-def _fast_sigmoid(x):
-  if is_rocm():
-    return jax.nn.sigmoid(x)
-  return 0.5 + 0.5 * plgpu.approx_tanh(0.5 * x)
 
 
 def _and(a, b):
@@ -238,7 +233,7 @@ def _kernel(q_ref, k_ref, v_ref, *rest,
       g = plgpu.load(g_ref.at[:, pl.dslice(off, w)], mask=m, other=0.0).astype(jnp.float32)
       gb = (gb_ref[pl.dslice(off, w)] if c is None else
             plgpu.load(gb_ref.at[pl.dslice(off, w)], mask=c, other=0.0)).astype(jnp.float32)
-      o = o * _fast_sigmoid(g + gb[None, :])
+      o = o * sigmoid(g + gb[None, :])
     if trim:
       o = jnp.where(empty[:, None], 0.0, o)
     plgpu.store(o_ref.at[:, pl.dslice(off, w)], o.astype(o_ref.dtype), mask=m)

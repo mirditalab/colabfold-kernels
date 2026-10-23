@@ -95,9 +95,8 @@ def _kernel(x_ref, s_ref, o_ref_ln, w1_ref, b1_ref, w2_ref, b2_ref, *refs, eps, 
 
 
 def supported(c, hdim):
-  # 1.9x over XLA at 128 channels; at 256 (1 MB of weights) XLA's GEMM is 1.4-2.5x faster on A100 and gfx1151
-  top = 128 if is_rocm() or compute_capability() == 80 else 256
-  return c & (c - 1) == 0 and 16 <= c <= top and hdim % 64 == 0
+  # gfx1151: 1.9x over XLA at 128 channels, no faster at 256; the A100 keeps 256 too, as keep skips an MSA's padded rows
+  return c & (c - 1) == 0 and 16 <= c <= (128 if is_rocm() else 256) and hdim % 64 == 0
 
 
 @functools.partial(jax.jit, static_argnames=("eps", "add_input", "block_m", "chunk", "num_warps",
