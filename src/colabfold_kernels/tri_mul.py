@@ -14,7 +14,7 @@ import jax, jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
-from colabfold_kernels.device import is_rocm, shared_memory_limit
+from colabfold_kernels.device import compute_capability, is_rocm, shared_memory_limit
 from colabfold_kernels.transition import fast, ln_rows, ref_ln, sigmoid, unless_padding
 from colabfold_kernels.tri_flash import e4m3
 
@@ -218,7 +218,7 @@ def gated_dual_proj(x, wp, bp, wg, bg, mask, *, block_m=None, split=False,
 
 
 @functools.partial(jax.jit, static_argnames=("eps", "block_m", "fp8", "transpose", "pad"))
-def ln_gated_dual_proj(x, ln_scale, ln_offset, wp, bp, wg, bg, mask, *, eps=1e-5, block_m=64, fp8=False,
+def ln_gated_dual_proj(x, ln_scale, ln_offset, wp, bp, wg, bg, mask, *, eps=1e-5, block_m=None, fp8=False,
                        transpose=False, pad=1):
   """gated_dual_proj(LN(x), ..., split=True, channel_major=True) in one pass over the raw input x [M, K].
 
@@ -229,9 +229,15 @@ def ln_gated_dual_proj(x, ln_scale, ln_offset, wp, bp, wg, bg, mask, *, eps=1e-5
   """
   K = x.shape[-1]
   ci = wp.shape[1] // 2
-  # past 128 channels the weights stream by output column
-  chunk = None if epilogue_supported(K, ci, ci) else _STREAM[2]
-  block_m, num_warps = (_STREAM[0], _STREAM[1]) if chunk else (block_m, 4)
+  # past 128 channels the weights stream by output column; on an A100 at 128 channels, streaming 64 columns a loop
+  # keeps the four 128x128 weight tiles from hitting 255 registers and 80 KB of shared memory (1.11-1.18x past 16k rows)
+  if not epilogue_supported(K, ci, ci):
+    block_m, num_warps, chunk = _STREAM
+  elif compute_capability() == 80 and not is_rocm() and K == 128 and ci == 128 and block_m is None:
+    m_tot = x.shape[0] * x.shape[1] if x.ndim == 3 else x.shape[0]
+    block_m, num_warps, chunk = (128, 4, 64) if m_tot > 16_384 else (64, 4, None)
+  else:
+    block_m, num_warps, chunk = block_m or 64, 4, None
   dtype = jnp.float8_e4m3fn if fp8 else x.dtype
   halves = [t for w, b in ((wp, bp), (wg, bg)) for t in (w[:, :ci], b[:ci])]
   halves += [t for w, b in ((wp, bp), (wg, bg)) for t in (w[:, ci:], b[ci:])]
@@ -486,9 +492,9 @@ def _ln_kernel(x_ref, scale_ref, offset_ref, o_ref, *, eps, m, c, block_m):
 _TILE_BYTES = 32 * 1024
 
 
-@functools.partial(jax.jit, static_argnames=("eps", "block_m"))
-def pallas_layer_norm(x, scale, offset, *, eps=1e-5, block_m=64):
-  # x [..., c]; normalize over last axis; scale/offset [c]. Returns x's shape/dtype.
+@functools.partial(jax.jit, static_argnames=("eps", "block_m", "out_dtype"))
+def pallas_layer_norm(x, scale, offset, *, eps=1e-5, block_m=64, out_dtype=None):
+  # x [..., c]; normalize over last axis; scale/offset [c]. Returns x's shape, in out_dtype or x's dtype.
   c = x.shape[-1]
   bc = max(16, 1 << (c - 1).bit_length())        # Triton tiles are powers of two
   xf = x.reshape(-1, c)
@@ -502,7 +508,7 @@ def pallas_layer_norm(x, scale, offset, *, eps=1e-5, block_m=64):
                 pl.BlockSpec((bc,), lambda i: (0,)),
                 pl.BlockSpec((bc,), lambda i: (0,))],
       out_specs=pl.BlockSpec((block_m, bc), lambda i: (i, 0)),
-      out_shape=jax.ShapeDtypeStruct((m, c), x.dtype),
+      out_shape=jax.ShapeDtypeStruct((m, c), out_dtype or x.dtype),
       compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=2),
       name="pallas_layer_norm",
   )(xf, scale, offset)

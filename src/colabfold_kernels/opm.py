@@ -12,7 +12,58 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
+from colabfold_kernels.device import is_rocm
+from colabfold_kernels.transition import ln_rows, ref_ln
+
 _dot = functools.partial(jnp.dot, preferred_element_type=jnp.float32)
+
+
+def _proj_kernel(x_ref, s_ref, o_ref, lw_ref, lb_ref, rw_ref, rb_ref, m_ref, l_out, r_out, *, eps, m, block_m):
+  rows = (pl.program_id(0) * block_m + jnp.arange(block_m)) < m
+  x = plgpu.load(x_ref, mask=rows[:, None], other=0.0).astype(jnp.float32)
+  y = ln_rows(x, s_ref, o_ref, eps).astype(x_ref.dtype)
+  mv = plgpu.load(m_ref, mask=rows, other=0.0).astype(jnp.float32)[:, None]
+  la = mv * (_dot(y, lw_ref[...]) + lb_ref[...][None, :].astype(jnp.float32))
+  ra = mv * (_dot(y, rw_ref[...]) + rb_ref[...][None, :].astype(jnp.float32))
+  plgpu.store(l_out, la.astype(l_out.dtype), mask=rows[:, None])
+  plgpu.store(r_out, ra.astype(r_out.dtype), mask=rows[:, None])
+
+
+def proj_supported(c, k):
+  return c & (c - 1) == 0 and 16 <= c <= 256 and k & (k - 1) == 0 and 16 <= k <= 64
+
+
+@functools.partial(jax.jit, static_argnames=("eps", "block_m", "num_warps", "num_stages"))
+def opm_projection(x, ln_scale, ln_offset, lw, lb, rw, rb, mask, *, eps=1e-5, block_m=None, num_warps=None,
+                   num_stages=1):
+  c, k = x.shape[-1], lw.shape[1]
+  xf = x.reshape(-1, c)
+  m = xf.shape[0]
+  block_m = block_m or (64 if c > 128 or is_rocm() else 128)
+  num_warps = num_warps or (4 if block_m == 64 else 8)
+  vec = lambda n: pl.BlockSpec((n,), lambda i: (0,))
+  out_s = pl.BlockSpec((block_m, k), lambda i: (i, 0))
+  la, ra = pl.pallas_call(
+      functools.partial(_proj_kernel, eps=eps, m=m, block_m=block_m),
+      grid=(pl.cdiv(m, block_m),),
+      in_specs=[pl.BlockSpec((block_m, c), lambda i: (i, 0)), vec(c), vec(c),
+                pl.BlockSpec((c, k), lambda i: (0, 0)), vec(k),
+                pl.BlockSpec((c, k), lambda i: (0, 0)), vec(k),
+                pl.BlockSpec((block_m,), lambda i: (i,))],
+      out_specs=[out_s, out_s],
+      out_shape=[jax.ShapeDtypeStruct((m, k), x.dtype)] * 2,
+      compiler_params=plgpu.CompilerParams(num_warps=num_warps, num_stages=num_stages),
+      name="opm_projection",
+  )(xf, ln_scale, ln_offset, lw, lb, rw, rb, mask.reshape(m))
+  shape = x.shape[:-1] + (k,)
+  return la.reshape(shape), ra.reshape(shape)
+
+
+def ref_opm_projection(x, ln_scale, ln_offset, lw, lb, rw, rb, mask, *, eps=1e-5):
+  y = ref_ln(x.astype(jnp.float32), ln_scale, ln_offset, eps)
+  mv = mask.astype(jnp.float32)[..., None]
+  return (mv * (y @ lw.astype(jnp.float32) + lb.astype(jnp.float32)),
+          mv * (y @ rw.astype(jnp.float32) + rb.astype(jnp.float32)))
 
 
 def _kernel(a_ref, t_ref, b_ref, n_ref, *rest, m, block_m, block_k, eps):

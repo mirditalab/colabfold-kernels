@@ -3,7 +3,7 @@ import os, sys, jax, jax.numpy as jnp, numpy as np
 sys.path.insert(0, os.environ.get(
     "CK_SRC", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src")))
 from colabfold_kernels import fused_ops
-from colabfold_kernels.packed_attn import ref_packed_attention
+from colabfold_kernels.packed_attn import ref_global_attention, ref_packed_attention
 from colabfold_kernels.transition import ref_glu_transition, ref_transition
 from colabfold_kernels.tri_mul import ref_trimul_epilogue
 
@@ -57,6 +57,9 @@ for tag, cfg, adt in configs:
     ref = lambda p, bias, kmask, gb: ref_packed_attention(p, bias, kmask, gb, sm_scale=D ** -.5, column=column)
     check(f"{tag} packed_attention {X}x{Y} {H}x{D} {'col' if column else 'row'}{' gated' if gated else ''}",
           call, ref, (p, bias, kmask, gb), [0, 1] + ([3] if gated else []))
+    if tag != "sm70" and tag != "sm75" and (X, Y) in ((96, 64), (50, 50)):
+      check(f"{tag} packed_attention {X}x{Y} {H}x{D} {'col' if column else 'row'}{' gated' if gated else ''} no bias",
+            call, ref, (p, None, kmask, gb), [0] + ([3] if gated else []))
 
 # tiny row counts leave only a partial block
 for M, C, F in ((4096, 128, 4), (777, 64, 4), (1000, 256, 4), (300, 64, 2), (1, 128, 4), (64, 128, 4), (127, 128, 4)):
@@ -92,6 +95,18 @@ for M, C, xdt in ((4096, 128, dt), (999, 128, dt), (500, 64, dt), (1, 128, dt), 
   check(f"trimul_epilogue {tag}", ep, ref_trimul_epilogue, args, list(range(8)))
   for res in (f(M, C), f32(M, C)):
     check(f"trimul_epilogue {tag} +{res.dtype} residual", ep, ref_trimul_epilogue, args + (res,), list(range(9)))
+
+for S, B, C, H, D in ((1, 68, 64, 8, 8), (1, 259, 64, 8, 8), (300, 59, 64, 8, 8), (512, 127, 64, 8, 8)):
+  ga = fused_ops.global_attention(gc, dt, C, H, D, D)
+  mask = jnp.asarray((rng.random((S, B)) > (.0 if S == 1 else .15)).astype(np.float32), dt)
+  args = (f(S, B, C, s=2.), mask, 1 + f32(C, s=.1), f32(C, s=.1), f(C, H, D, s=C ** -.5),
+          f(C, D, s=C ** -.5), f(C, D, s=C ** -.5), f(C, H, D, s=C ** -.5), f(H, D, s=.1),
+          f(H, D, C, s=(H * D) ** -.5), f(C, s=.1))
+  for add in (False, True):
+    check(f"global_attention {S}x{B}x{C}{' +x' if add else ''}",
+          lambda *a, add=add: ga(*a, add_input=add),
+          lambda *a, add=add: ref_global_attention(*a, add_input=add),
+          args, [0, 2, 3, 4, 5, 6, 7, 8, 9, 10])
 
 print("FAIL" if bad else "PASS", bad)
 sys.exit(bool(bad))
