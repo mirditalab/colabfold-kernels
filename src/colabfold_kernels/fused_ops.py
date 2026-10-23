@@ -30,6 +30,9 @@ def register_ffi_targets(global_config):
   if global_config.get('fp8', False):
     from colabfold_kernels import contract
     contract.available()
+  if global_config.get('length_buckets', False):
+    from colabfold_kernels import contract
+    contract.live_available()
 
 
 def _legacy_half(global_config, dtype):
@@ -273,6 +276,21 @@ def fp8_contraction(global_config, dtype, num_channel, num_intermediate, num_res
   proj = differentiable_via(functools.partial(tri_mul.ln_gated_dual_proj, fp8=True, pad=16),
                             functools.partial(tri_mul.ref_ln_gdp, pad=16), nondiff=('eps', 'transpose'))
   return proj, differentiable_via(contract.fp8_contract, contract.ref_fp8_contract)
+
+
+def live_contraction(global_config, dtype):
+  """-> (f(a, b, live, *, incoming), rounding) or None: the triangle contraction over a bucketed fold's live length
+  only (contract.live_contract), which computes up to live rounded to rounding. None on ROCm, where only a GEMM over
+  the whole padded length runs. Callers take fp8_contraction first (cuBLASLt over all of it is the faster), this where
+  it declines. One kernel for every card: the legacy ones (sm_70/75, float16) get it from colabfold-cuda-kernels too."""
+  from colabfold_kernels.grads import differentiable_via
+  if _legacy_half(global_config, dtype) is None and not _pallas_half(global_config, dtype):
+    return None
+  from colabfold_kernels import contract
+  if not contract.live_available():
+    return None
+  return (differentiable_via(contract.live_contract, contract.ref_live_contract, nondiff=('incoming',)),
+          contract.LIVE_ROUND)
 
 
 def ln_projection(global_config, dtype, num_channel, num_output=None):
