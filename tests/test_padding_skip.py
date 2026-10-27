@@ -24,12 +24,19 @@ def f(*shape, s=1.0):
   return jnp.asarray(rng.normal(size=shape) * s, dt)
 
 
-def check(name, outs, refs, tol):
+def padding(mask, pad=1):
+  """Where the outputs must be zero: the mask's zeros, its last axis padded to a multiple of pad."""
+  zero = np.asarray(mask) == 0
+  return np.pad(zero, [(0, 0)] * (zero.ndim - 1) + [(0, -zero.shape[-1] % pad)], constant_values=True)
+
+
+def check(name, outs, refs, tol, zero):
   worst = 0.0
   ok = True
   for o, r in zip(outs, refs):
     o, r = np.asarray(o.astype(jnp.float32)), np.asarray(r)
-    pad = r == 0
+    # from the mask, not r == 0: the reference's GEMM varies by process and can round a real output to exactly 0
+    pad = np.broadcast_to(zero, o.shape)
     err = float(np.abs(o - r).max() / (np.abs(r).max() + 1e-6))
     ok &= bool(np.isfinite(o).all()) and err < tol and float(np.abs(o[pad]).max(initial=0)) == 0
     worst = max(worst, err)
@@ -48,15 +55,17 @@ for S, n in [(256, 256), (256, 200), (256, 129), (256, 63), (192, 65)]:
     if not (tm.epilogue_supported(cz, ci, ci) or tm.stream_supported(cz, ci, widest=256)):
       continue
     out = tm.ln_gated_dual_proj(x.reshape(-1, cz), *g, mask.reshape(-1))
-    check(f"ln_gdp flat S={S} n={n} {cz}->{ci}", out, tm.ref_ln_gdp(x.reshape(-1, cz), *g, mask.reshape(-1)), 0.02)
+    check(f"ln_gdp flat S={S} n={n} {cz}->{ci}", out, tm.ref_ln_gdp(x.reshape(-1, cz), *g, mask.reshape(-1)), 0.02,
+          padding(mask.reshape(-1)))
     for transpose in (False, True):
+      tmask = mask.T if transpose else mask
       out = tm.ln_gated_dual_proj(x, *g, mask, transpose=transpose)
       check(f"ln_gdp pair S={S} n={n} {cz}->{ci} {'T' if transpose else ''}", out,
-            tm.ref_ln_gdp(x, *g, mask, transpose=transpose), 0.02)
+            tm.ref_ln_gdp(x, *g, mask, transpose=transpose), 0.02, padding(tmask))
       if fp8 and ci == 128:
         out = tm.ln_gated_dual_proj(x, *g, mask, fp8=True, transpose=transpose, pad=16)
         check(f"ln_gdp e4m3 S={S} n={n} {'T' if transpose else ''}", out,
-              tm.ref_ln_gdp(x, *g, mask, transpose=transpose, pad=16), 0.08)
+              tm.ref_ln_gdp(x, *g, mask, transpose=transpose, pad=16), 0.08, padding(tmask, 16))
 
 
 def check_keep(name, with_keep, without, keep, pad_value):
@@ -142,7 +151,7 @@ for S, n in [(256, 200), (384, 129), (192, 65)]:
   for o, r in zip(out, ref):
     o, r = np.asarray(o.astype(jnp.float32))[:, :R, :R], np.asarray(r)[:, :R, :R]
     ok &= bool(np.isfinite(o).all()) and float(np.abs(o - r).max() / (np.abs(r).max() + 1e-6)) < 0.02
-    ok &= float(np.abs(o[r == 0]).max(initial=0)) == 0
+    ok &= float(np.abs(o[:, ~(np.asarray(mask)[:R, :R] > 0)]).max(initial=0)) == 0
   print(f"{'ok  ' if ok else 'BAD '}keep below zero S={S} n={n}: real rows as without, padding inside the block too or zeros")
   if not ok:
     fails.append(f"keep below zero S={S} n={n}")
