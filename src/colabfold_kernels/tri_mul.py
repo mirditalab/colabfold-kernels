@@ -14,7 +14,7 @@ import jax, jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
-from colabfold_kernels.device import is_rocm, shared_memory_limit
+from colabfold_kernels.device import is_rocm, multiprocessor_count, shared_memory_limit
 from colabfold_kernels.transition import fast, ln_rows, ref_ln, sigmoid, unless_padding
 from colabfold_kernels.tri_flash import e4m3
 
@@ -105,6 +105,81 @@ def _ln_gdp_kernel(x_ref, s_ref, offset_ref, wpl_ref, bpl_ref, wgl_ref, bgl_ref,
 
   # the rows past m up to m_out are the FP8 GEMM's zero padding: written
   unless_padding(mask_ref, rows, compute, padding, other=0)
+
+
+def _ln_gdp_persistent_kernel(x_ref, wp_ref, wg_ref, fold_ref, mask_ref, ol_ref, or_ref, *,
+                              activation, eps, m, block_m, width, streams):
+  # _ln_gdp_kernel, persistent: program (stream, group) owns `width` output columns of one half and every streams-th
+  # row block, loading its weights once; the LN is folded into them (_ln_gdp_persistent), so raw rows feed the MMA
+  stream, group = pl.program_id(0), pl.program_id(1)
+  cols = pl.ds(pl.multiple_of(group * width, width), width)
+  wp_s, wg_s = wp_ref[:, cols], wg_ref[:, cols]
+  sum_p, sum_g, bias_p, bias_g = (fold_ref[i, cols] for i in range(4))
+  left = ol_ref.shape[0] // width  # groups writing the left half; the rest write the right
+  out_cols = pl.ds(pl.multiple_of(group % left * width, width), width)
+
+  def block(j, carry):
+    row = (stream + j * streams) * block_m + jnp.arange(block_m)
+    rows = row < m
+    span = pl.ds(pl.multiple_of((stream + j * streams) * block_m, block_m), block_m)
+
+    def store(val):
+      @pl.when(group < left)
+      def _():
+        plgpu.store(ol_ref.at[out_cols, span], val.astype(ol_ref.dtype), mask=rows[None, :])
+
+      @pl.when(group >= left)
+      def _():
+        plgpu.store(or_ref.at[out_cols, span], val.astype(or_ref.dtype), mask=rows[None, :])
+
+    def compute():
+      x = plgpu.load(x_ref.at[span, :], mask=rows[:, None], other=0.0)
+      xf = x.astype(jnp.float32)
+      mean = jnp.mean(xf, axis=-1, keepdims=True)
+      d = xf - mean
+      rstd = jax.lax.rsqrt(jnp.mean(d * d, axis=-1, keepdims=True) + eps)
+      proj = rstd * (_dot(x, wp_s) - mean * sum_p[None, :]) + bias_p[None, :]
+      gate = rstd * (_dot(x, wg_s) - mean * sum_g[None, :]) + bias_g[None, :]
+      # below zero: outside what the contraction reads, not written; inside a computed block it masks like zero
+      mask = jnp.maximum(plgpu.load(mask_ref.at[span], mask=rows, other=0), 0)
+      store((mask[:, None].astype(jnp.float32) * proj * fast(activation)(gate)).T)
+
+    unless_padding(mask_ref.at[span], rows, compute, lambda: store(jnp.zeros((width, block_m), jnp.float32)), other=0)
+    return carry
+
+  count = (pl.cdiv(m, block_m) - stream + streams - 1) // streams
+  jax.lax.fori_loop(0, count, block, 0)
+
+
+# swept on sm_120 at c = 128 (N = 256 and 1024): two programs per SM, 64 columns each; more of either was slower
+_PERSISTENT_WIDTH, _PERSISTENT_PER_SM = 64, 2
+
+
+def _persistent_supported(k, ci):
+  # 64 channels ran 25-33% slower than _ln_gdp_kernel
+  return k == 128 and ci == 128 and multiprocessor_count() is not None
+
+
+def _ln_gdp_persistent(x, ln_scale, ln_offset, wp, bp, wg, bg, mask, *, eps, block_m):
+  """ln_gated_dual_proj's flat form [M, K] -> left, right [ci, M] with _ln_gdp_persistent_kernel."""
+  M = x.shape[0]
+  ci = wp.shape[1] // 2
+  groups = 2 * ci // _PERSISTENT_WIDTH
+  streams = max(1, min(pl.cdiv(M, block_m), multiprocessor_count() * _PERSISTENT_PER_SM // groups))
+  # LN(x) W + b = rstd (x W' - mean colsum(W')) + offset W + b with W' = scale W;
+  # the colsum of the rounded W' the MMA reads
+  scale, offset = ln_scale.astype(jnp.float32), ln_offset.astype(jnp.float32)
+  wp_s, wg_s = ((scale[:, None] * w.astype(jnp.float32)).astype(x.dtype) for w in (wp, wg))
+  fold = jnp.stack([wp_s.astype(jnp.float32).sum(0), wg_s.astype(jnp.float32).sum(0),
+                    offset @ wp.astype(jnp.float32) + bp.astype(jnp.float32),
+                    offset @ wg.astype(jnp.float32) + bg.astype(jnp.float32)])
+  return pl.pallas_call(
+      functools.partial(_ln_gdp_persistent_kernel, activation=jax.nn.sigmoid, eps=eps, m=M, block_m=block_m,
+                        width=_PERSISTENT_WIDTH, streams=streams),
+      grid=(streams, groups),
+      out_shape=[jax.ShapeDtypeStruct((ci, M), x.dtype)] * 2,
+      compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=1), name="ln_gated_dual_proj",
+  )(x, wp_s, wg_s, fold, mask)
 
 
 def _gdp_kernel_split(x_ref, wpl_ref, bpl_ref, wgl_ref, bgl_ref,
@@ -234,6 +309,10 @@ def ln_gated_dual_proj(x, ln_scale, ln_offset, wp, bp, wg, bg, mask, *, eps=1e-5
   # past 128 channels the weights stream by output column
   chunk = None if epilogue_supported(K, ci, ci) else _STREAM[2]
   block_m, num_warps = (_STREAM[0], _STREAM[1]) if chunk else (block_m, 4)
+  if chunk is None and not fp8 and (x.ndim == 2 or not transpose and pad == 1) and _persistent_supported(K, ci):
+    left, right = _ln_gdp_persistent(x.reshape(-1, K), ln_scale, ln_offset, wp, bp, wg, bg, mask.reshape(-1), eps=eps,
+                                     block_m=block_m)
+    return left.reshape(ci, *x.shape[:-1]), right.reshape(ci, *x.shape[:-1])
   dtype = jnp.float8_e4m3fn if fp8 else x.dtype
   halves = [t for w, b in ((wp, bp), (wg, bg)) for t in (w[:, :ci], b[:ci])]
   halves += [t for w, b in ((wp, bp), (wg, bg)) for t in (w[:, ci:], b[ci:])]

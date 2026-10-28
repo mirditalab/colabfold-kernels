@@ -32,6 +32,16 @@ def l2_cache_size():
     return None
 
 
+@functools.lru_cache(maxsize=None)
+def multiprocessor_count():
+  """The first GPU's streaming multiprocessors (compute units on AMD), or None."""
+  try:
+    import jax
+    return getattr(jax.devices()[0], "core_count", None) or None
+  except Exception:
+    return None
+
+
 def shared_memory_limit():
   """The smallest shared memory budget across the GPUs here, or None."""
   import jax
