@@ -298,8 +298,24 @@ def fused_available(cc, kernel):
     return _load(kernel, cc, (_fused_symbol(_FUSED_SYMBOLS[kernel], cc),))
 
 
+# The tri-mul also takes wider pairs at equal input and hidden widths (Protenix-v2 256, Mol-1 320 and 448) on cards
+# with the shared memory its kernels stage: 448 does not fit a T4's 64 KB, so there it stays in XLA.
+WIDE_TRIMUL_WIDTHS = (256, 320, 448)
+
+
+def _wide_trimul_smem(c):
+    """The larger of ln_gdp's (64 rows of input) and the epilogue's (32 rows of both inputs) dynamic shared memory at
+    width c, in the WMMA build, which needs a little more than the mma one."""
+    return max(64 * (c + 8) * 2 + 9216 + 4096, 2 * 32 * (c + 8) * 2 + 5120 + 4096 + 512)
+
+
 def ln_gdp_supported(num_channel, num_intermediate):
-    return num_channel in FUSED_WIDTHS and num_intermediate in FUSED_WIDTHS
+    if num_channel in FUSED_WIDTHS and num_intermediate in FUSED_WIDTHS:
+        return True
+    from colabfold_kernels.device import shared_memory_limit
+    limit = shared_memory_limit()
+    return (num_channel == num_intermediate and num_channel in WIDE_TRIMUL_WIDTHS and limit is not None
+            and _wide_trimul_smem(num_channel) <= limit)
 
 
 def projection_supported(*widths):
@@ -356,7 +372,8 @@ def volta_trimul_epilogue_ln(x_cm, x, in_scale, in_offset, ln_scale, ln_offset, 
                              eps=1e-5, add_input=False, cc):
     """tri_mul.trimul_epilogue_ln for sm_70/75. Widths the kernel does not take run the reference in XLA."""
     c, ca, o = x_cm.shape[0], x.shape[1], wo.shape[1]
-    if not ln_gdp_supported(c, ca) or o not in FUSED_WIDTHS or (add_input and o != ca):
+    wide = c == ca == o and c in WIDE_TRIMUL_WIDTHS
+    if not ln_gdp_supported(c, ca) or (o not in FUSED_WIDTHS and not wide) or (add_input and o != ca):
         from colabfold_kernels.tri_mul import ref_trimul_epilogue_ln
         return ref_trimul_epilogue_ln(x_cm, x, in_scale, in_offset, ln_scale, ln_offset, wo, bo, wg, bg, keep,
                                       eps=eps, add_input=add_input).astype(x.dtype)
