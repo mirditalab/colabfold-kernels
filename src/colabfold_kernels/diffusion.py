@@ -17,10 +17,10 @@ DEC = H + "diffusion_atom_transformer_decoder/"
 NUM_AF3_RESTYPES = 31
 
 # model conventions that reach the per-step computation (alphafold3/model/model_config.py)
-MODELS = ("openfold3", "openbind0", "protenix1", "protenix2", "opendde", "boltz2", "intellifold2",
+MODELS = ("openfold3", "openbind0", "protenix1", "protenix2", "mol1", "opendde", "boltz2", "intellifold2",
           "rosettafold3", "chai1", "esmfold2", "esmfold2_fast", "esmfold2_lm600m", "esmfold2_lm300m")
-OR_KEY_MASK = ("protenix1", "protenix2", "opendde", "boltz2", "intellifold2", "rosettafold3")
-CHAINED_KEY_ADALN = ("protenix1", "protenix2", "opendde")
+OR_KEY_MASK = ("protenix1", "protenix2", "mol1", "opendde", "boltz2", "intellifold2", "rosettafold3")
+CHAINED_KEY_ADALN = ("protenix1", "protenix2", "mol1", "opendde")
 MASK_TRANSITIONS = ("openfold3", "openbind0")
 PRE_TRUNK_QUERY = ("boltz2", "rosettafold3", "chai1")
 PARALLEL_BLOCKS = ("rosettafold3", "chai1")
