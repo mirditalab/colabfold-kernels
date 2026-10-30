@@ -78,6 +78,8 @@ assert fused_ops.ln_projection(gc, dt, 8, 64) is None and fused_ops.output_proje
 
 # past 128 channels (protenix2's 256-channel pair, Mol-1's 320 and 448) tiled with the LN folded in, to 512
 for a, ci, m in ((256, 256, 4101), (256, 128, 59), (128, 256, 777), (320, 320, 4101), (448, 448, 777), (320, 128, 59)):
+  if max(a, ci) > 256 and not tm.tiled_supported(a, ci):
+    continue  # past the streamed widths only tiled, which ROCm leaves to XLA
   x, sc, of = f(m, a, s=2.), f32(a), f32(a)
   mask = jnp.asarray((rng.uniform(size=m) > .1).astype(np.float32), dt)
   check(f"ln_gdp streamed a={a} ci={ci} m={m}", fused_ops.ln_gated_dual_proj(gc, dt, a, ci), tm.ref_ln_gdp,
@@ -89,7 +91,7 @@ for a, ci, m in ((256, 256, 4101), (512, 512, 127), (320, 320, 4101), (448, 448,
     check(f"epilogue_ln streamed a={a} m={m} add_input={add}",
           lambda *z, add=add: fused_ops.trimul_epilogue_ln(gc, dt)(*z, add_input=add),
           lambda *z, add=add: tm.ref_trimul_epilogue_ln(*z, add_input=add), [f(ci, m, s=2.), x, sc, of, *ep], [0, 1])
-assert fused_ops.ln_gated_dual_proj(gc, dt, 512, 512) is not None
+assert (fused_ops.ln_gated_dual_proj(gc, dt, 512, 512) is not None) == tm.tiled_supported(512, 512)
 assert fused_ops.ln_gated_dual_proj(gc, dt, 640, 640) is None
 
 # the MSA stack's 256 channels: the weight streamed in 64-row blocks
