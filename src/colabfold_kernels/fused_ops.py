@@ -255,9 +255,10 @@ def ln_gated_dual_proj(global_config, dtype, num_channel, num_intermediate):
     return None
   from colabfold_kernels.grads import differentiable_via
   from colabfold_kernels import tri_mul
-  # streamed up to 256 channels; at 512 XLA's projection is faster
+  # streamed up to 256 channels; tiled with the LN folded in to 512, any multiple of 64 (Mol-1's 320 and 448)
   if not (tri_mul.epilogue_supported(num_channel, num_intermediate, num_intermediate)
-          or tri_mul.stream_supported(num_channel, num_intermediate, widest=256)):
+          or tri_mul.stream_supported(num_channel, num_intermediate, widest=256)
+          or tri_mul.tiled_supported(num_channel, num_intermediate)):
     return None
   return differentiable_via(tri_mul.ln_gated_dual_proj, tri_mul.ref_ln_gdp, nondiff=('eps',))
 
@@ -270,6 +271,9 @@ def fp8_contraction(global_config, dtype, num_channel, num_intermediate, num_res
     return None
   from colabfold_kernels.grads import differentiable_via
   from colabfold_kernels import contract, tri_mul
+  # the e4m3 projection streams: power-of-two widths only, the tiled widths (Mol-1's) stay bfloat16
+  if not tri_mul.stream_supported(num_channel, num_intermediate, widest=256):
+    return None
   # the product's rows are num_res wide: cuBLASLt wants them 16 bytes (ColabFold pads the length to 8)
   if not contract.supported(16, num_res) or not contract.available():
     return None

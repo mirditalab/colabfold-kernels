@@ -166,13 +166,8 @@ def _ln_gdp_persistent(x, ln_scale, ln_offset, wp, bp, wg, bg, mask, *, eps, blo
   ci = wp.shape[1] // 2
   groups = 2 * ci // _PERSISTENT_WIDTH
   streams = max(1, min(pl.cdiv(M, block_m), multiprocessor_count() * _PERSISTENT_PER_SM // groups))
-  # LN(x) W + b = rstd (x W' - mean colsum(W')) + offset W + b with W' = scale W;
-  # the colsum of the rounded W' the MMA reads
-  scale, offset = ln_scale.astype(jnp.float32), ln_offset.astype(jnp.float32)
-  wp_s, wg_s = ((scale[:, None] * w.astype(jnp.float32)).astype(x.dtype) for w in (wp, wg))
-  fold = jnp.stack([wp_s.astype(jnp.float32).sum(0), wg_s.astype(jnp.float32).sum(0),
-                    offset @ wp.astype(jnp.float32) + bp.astype(jnp.float32),
-                    offset @ wg.astype(jnp.float32) + bg.astype(jnp.float32)])
+  (wp_s, fp), (wg_s, fg) = _fold(wp, ln_scale, ln_offset, bp, x.dtype), _fold(wg, ln_scale, ln_offset, bg, x.dtype)
+  fold = jnp.stack([fp[0], fg[0], fp[1], fg[1]])
   return pl.pallas_call(
       functools.partial(_ln_gdp_persistent_kernel, activation=jax.nn.sigmoid, eps=eps, m=M, block_m=block_m,
                         width=_PERSISTENT_WIDTH, streams=streams),
@@ -180,6 +175,105 @@ def _ln_gdp_persistent(x, ln_scale, ln_offset, wp, bp, wg, bg, mask, *, eps, blo
       out_shape=[jax.ShapeDtypeStruct((ci, M), x.dtype)] * 2,
       compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=1), name="ln_gated_dual_proj",
   )(x, wp_s, wg_s, fold, mask)
+
+
+def _fold(w, scale, offset, b, dtype):
+  """LN(x) w + b = rstd (x w' - mean colsum(w')) + offset w + b with w' = scale w, so the raw rows feed the MMA:
+  w' in dtype and [colsum(w'), offset w + b], the colsum of the rounded w' the MMA reads."""
+  ws = (scale.astype(jnp.float32)[:, None] * w.astype(jnp.float32)).astype(dtype)
+  return ws, jnp.stack([ws.astype(jnp.float32).sum(0),
+                        offset.astype(jnp.float32) @ w.astype(jnp.float32) + b.astype(jnp.float32)])
+
+
+def _row_stats(x, axis, eps):
+  """[mean, 1 / sigma] of x's rows over `axis` in float32, [2, M]: a folded LN's statistics, one read of x in XLA, so
+  the tiled kernels' K loops are only MMAs (gathered there, every column tile repeated them and ran 1.5x slower)."""
+  xf = x.astype(jnp.float32)
+  mean = xf.mean(axis)
+  return jnp.stack([mean, jax.lax.rsqrt(jnp.mean(jnp.square(xf - jnp.expand_dims(mean, axis)), axis) + eps)])
+
+
+def _tile(cols_outer):
+  """In a kernel: (row tile, column tile), the grid's axes in either order."""
+  return (pl.program_id(1), pl.program_id(0)) if cols_outer else (pl.program_id(0), pl.program_id(1))
+
+
+def _tile_grid(rows, cols, cols_outer):
+  return (cols, rows) if cols_outer else (rows, cols)
+
+
+def _ln_gdp_tiled_kernel(x_ref, st_ref, wp_ref, wg_ref, fp_ref, fg_ref, mask_ref, l_ref, r_ref, *, activation, m, k,
+                         ci, block_m, block_n, block_k, cols_outer):
+  # _ln_gdp_kernel as a tiled GEMM for wide pairs: program (rows, columns) loops over K with the LN folded (_fold, its
+  # statistics from _row_stats), so any multiple of 32 channels runs and no weight streams per chunk
+  i, j = _tile(cols_outer)
+  span = pl.ds(pl.multiple_of(i * block_m, block_m), block_m)
+  rows = i * block_m + jnp.arange(block_m) < m
+  cols = pl.ds(pl.multiple_of(j * block_n, block_n), block_n)
+  left = ci // block_n  # column blocks writing the left half; the rest write the right
+  out_cols = pl.ds(pl.multiple_of(j % left * block_n, block_n), block_n)
+
+  def store(val):
+    @pl.when(j < left)
+    def _():
+      plgpu.store(l_ref.at[out_cols, span], val.astype(l_ref.dtype), mask=rows[None, :])
+
+    @pl.when(j >= left)
+    def _():
+      plgpu.store(r_ref.at[out_cols, span], val.astype(r_ref.dtype), mask=rows[None, :])
+
+  def compute():
+    proj, gate = _folded_gemms(x_ref, st_ref, wp_ref, wg_ref, fp_ref, fg_ref, span, rows, cols, k, block_k)
+    # below zero: outside what the contraction reads, not written; inside a computed block it masks like zero
+    mask = jnp.maximum(plgpu.load(mask_ref.at[span], mask=rows, other=0), 0).astype(jnp.float32)
+    store((mask[:, None] * proj * fast(activation)(gate)).T)
+
+  unless_padding(mask_ref.at[span], rows, compute, lambda: store(jnp.zeros((block_n, block_m), jnp.float32)), other=0)
+
+
+def _folded_gemms(x_ref, st_ref, wp_ref, wg_ref, fp_ref, fg_ref, span, rows, cols, k, block_k):
+  """In a kernel: LN(x) wp + bp and LN(x) wg + bg for the rows `span` and columns `cols`, as GEMMs over K on the raw x
+  with the weights folded (_fold) and the rows' statistics from _row_stats."""
+  def body(t, acc):
+    ks = pl.ds(pl.multiple_of(t * block_k, block_k), block_k)
+    x = plgpu.load(x_ref.at[span, ks], mask=rows[:, None], other=0.0)
+    return acc[0] + _dot(x, wp_ref[ks, cols]), acc[1] + _dot(x, wg_ref[ks, cols])
+
+  zero = jnp.zeros((rows.shape[0], cols.size), jnp.float32)
+  acc_p, acc_g = jax.lax.fori_loop(0, k // block_k, body, (zero, zero))
+  return _unfold(acc_p, st_ref, fp_ref, span, rows, cols), _unfold(acc_g, st_ref, fg_ref, span, rows, cols)
+
+
+def _unfold(acc, st_ref, f_ref, span, rows, cols):
+  """In a kernel: rstd (acc - mean colsum) + bias, a folded GEMM's LN applied after it (_fold, _row_stats)."""
+  mean = plgpu.load(st_ref.at[0, span], mask=rows, other=0.0)[:, None]
+  rstd = plgpu.load(st_ref.at[1, span], mask=rows, other=0.0)[:, None]
+  return rstd * (acc - mean * f_ref[0, cols][None, :]) + f_ref[1, cols][None, :]
+
+
+# swept on sm_120 at 256-512 channels, N = 384 and 768: 128 x 64 tiles
+_TILED = (128, 64)
+
+
+def tiled_supported(k, ci):
+  """The tiled kernels' widths, to 512; not on ROCm, where they are untuned."""
+  return k % 32 == 0 and ci % _TILED[1] == 0 and max(k, ci) <= 512 and not is_rocm()
+
+
+def _ln_gdp_tiled(x, ln_scale, ln_offset, wp, bp, wg, bg, mask, *, eps):
+  """ln_gated_dual_proj's flat form [M, K] -> left, right [ci, M] with _ln_gdp_tiled_kernel."""
+  M, K = x.shape
+  ci = wp.shape[1] // 2
+  block_m, block_n = _TILED
+  cols_outer = K > 320  # swept at N = 384: rows outer at 320 channels, columns outer at 448
+  (wp_s, fp), (wg_s, fg) = _fold(wp, ln_scale, ln_offset, bp, x.dtype), _fold(wg, ln_scale, ln_offset, bg, x.dtype)
+  return pl.pallas_call(
+      functools.partial(_ln_gdp_tiled_kernel, activation=jax.nn.sigmoid, m=M, k=K, ci=ci, block_m=block_m,
+                        block_n=block_n, block_k=32, cols_outer=cols_outer),
+      grid=_tile_grid(pl.cdiv(M, block_m), 2 * ci // block_n, cols_outer),
+      out_shape=[jax.ShapeDtypeStruct((ci, M), x.dtype)] * 2,
+      compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=3), name="ln_gated_dual_proj",
+  )(x, _row_stats(x, 1, eps), wp_s, wg_s, fp, fg, mask)
 
 
 def _gdp_kernel_split(x_ref, wpl_ref, bpl_ref, wgl_ref, bgl_ref,
@@ -299,7 +393,8 @@ def ln_gated_dual_proj(x, ln_scale, ln_offset, wp, bp, wg, bg, mask, *, eps=1e-5
                        transpose=False, pad=1):
   """gated_dual_proj(LN(x), ..., split=True, channel_major=True) in one pass over the raw input x [M, K].
 
-  Returns left, right [P/2, M]. K must be a power of two, the LayerNorm needs whole rows.
+  Returns left, right [P/2, M]. Past 128 channels the plain form is tiled (tiled_supported); the others stream
+  power-of-two widths.
   fp8 writes them e4m3, unscaled and saturating. The pair x [A, B, K] with mask [A, B] gives left, right
   [P/2, A, B'], B' being B padded with zeros to a multiple of pad; transpose reads it transposed, [P/2, B, A'], so
   the incoming edges' operands come out contracted along their last axis too.
@@ -312,6 +407,9 @@ def ln_gated_dual_proj(x, ln_scale, ln_offset, wp, bp, wg, bg, mask, *, eps=1e-5
   if chunk is None and not fp8 and (x.ndim == 2 or not transpose and pad == 1) and _persistent_supported(K, ci):
     left, right = _ln_gdp_persistent(x.reshape(-1, K), ln_scale, ln_offset, wp, bp, wg, bg, mask.reshape(-1), eps=eps,
                                      block_m=block_m)
+    return left.reshape(ci, *x.shape[:-1]), right.reshape(ci, *x.shape[:-1])
+  if chunk is not None and not fp8 and (x.ndim == 2 or not transpose and pad == 1) and tiled_supported(K, ci):
+    left, right = _ln_gdp_tiled(x.reshape(-1, K), ln_scale, ln_offset, wp, bp, wg, bg, mask.reshape(-1), eps=eps)
     return left.reshape(ci, *x.shape[:-1]), right.reshape(ci, *x.shape[:-1])
   dtype = jnp.float8_e4m3fn if fp8 else x.dtype
   halves = [t for w, b in ((wp, bp), (wg, bg)) for t in (w[:, :ci], b[:ci])]
@@ -503,6 +601,65 @@ def _epilogue(x_cm, act, params, extra, dtype, *, eps, block_m, num_warps, num_s
   )(x_cm, act, *params, *extra, *([] if keep is None else [keep.reshape(m)]))
 
 
+def _epilogue_tiled_kernel(x_ref, a_ref, sx_ref, sa_ref, wo_ref, wg_ref, fo_ref, fg_ref, keep_ref, o_ref, *, m, c, ca,
+                          block_m, block_n, block_k, add_input):
+  # trimul_epilogue_ln as two tiled GEMMs for wide pairs (output projection over c, gate over ca), LNs folded (_fold).
+  # Not aliased: a row block's column tiles would overwrite input another tile still reads, so its padding copies
+  i, j = _tile(True)
+  span = pl.ds(pl.multiple_of(i * block_m, block_m), block_m)
+  rows = i * block_m + jnp.arange(block_m) < m
+  cols = pl.ds(pl.multiple_of(j * block_n, block_n), block_n)
+  keep = plgpu.load(keep_ref.at[span], mask=rows, other=0)
+  # the product read as zeros where keep leaves a row out: a contraction over the live length does not write it
+  xrows = rows & (keep > 0)
+
+  def gemm(ref, w_ref, n, channel_major):
+    def body(t, acc):
+      ks = pl.ds(pl.multiple_of(t * block_k, block_k), block_k)
+      v = (plgpu.load(ref.at[ks, span], mask=xrows[None, :], other=0.0).T if channel_major
+           else plgpu.load(ref.at[span, ks], mask=rows[:, None], other=0.0))
+      return acc + _dot(v.astype(w_ref.dtype), w_ref[ks, cols])
+
+    return jax.lax.fori_loop(0, n // block_k, body, jnp.zeros((block_m, block_n), jnp.float32))
+
+  @pl.when(jnp.max(keep.astype(jnp.float32)) > 0)
+  def _():
+    out = _unfold(gemm(x_ref, wo_ref, c, True), sx_ref, fo_ref, span, rows, cols)
+    out = out * sigmoid(_unfold(gemm(a_ref, wg_ref, ca, False), sa_ref, fg_ref, span, rows, cols))
+    if add_input:
+      out = out + plgpu.load(a_ref.at[span, cols], mask=rows[:, None], other=0.0).astype(jnp.float32)
+    plgpu.store(o_ref.at[span, cols], out.astype(o_ref.dtype), mask=rows[:, None])
+
+  @pl.when(jnp.max(keep.astype(jnp.float32)) <= 0)
+  def _():
+    pad = (plgpu.load(a_ref.at[span, cols], mask=rows[:, None], other=0.0) if add_input
+           else jnp.zeros((block_m, block_n), o_ref.dtype))
+    plgpu.store(o_ref.at[span, cols], pad.astype(o_ref.dtype), mask=rows[:, None])
+
+
+def _epilogue_tiled_supported(c, ca, o):
+  # at 256 channels and N = 768 the streamed epilogue is faster (1.5 against 1.75 ms); untuned on ROCm
+  return (all(w % 64 == 0 for w in (c, ca, o)) and not all(w & (w - 1) == 0 and w <= 256 for w in (c, ca, o))
+          and not is_rocm())
+
+
+def _epilogue_tiled(x_cm, x, in_scale, in_offset, ln_scale, ln_offset, wo, bo, wg, bg, keep, *, eps, add_input):
+  c, m = x_cm.shape
+  ca, o = x.shape[1], wo.shape[1]
+  assert not add_input or o == ca, (o, ca)  # the residual is read over the output's columns
+  (wo_s, fo), (wg_s, fg) = _fold(wo, ln_scale, ln_offset, bo, x.dtype), _fold(wg, in_scale, in_offset, bg, x.dtype)
+  keep = jnp.ones((m,), x.dtype) if keep is None else keep.reshape(m)
+  # the product's statistics over what the kernel reads: rows keep leaves out as zeros
+  sx = _row_stats(jnp.where(keep[None, :] > 0, x_cm, 0), 0, eps)
+  return pl.pallas_call(
+      functools.partial(_epilogue_tiled_kernel, m=m, c=c, ca=ca, block_m=_TILED[0], block_n=_TILED[1], block_k=64,
+                        add_input=add_input),
+      grid=_tile_grid(pl.cdiv(m, _TILED[0]), o // _TILED[1], True),
+      out_shape=jax.ShapeDtypeStruct((m, o), x.dtype),
+      compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=3), name="trimul_epilogue",
+  )(x_cm, x, sx, _row_stats(x, 1, eps), wo_s, wg_s, fo, fg, keep)
+
+
 @functools.partial(jax.jit, static_argnames=("eps", "add_input", "block_m", "num_warps", "num_stages"))
 def trimul_epilogue_ln(x_cm, x, in_scale, in_offset, ln_scale, ln_offset, wo, bo, wg, bg, keep=None, *, eps=1e-5,
                        add_input=False, block_m=64, num_warps=4, num_stages=2):
@@ -512,9 +669,12 @@ def trimul_epilogue_ln(x_cm, x, in_scale, in_offset, ln_scale, ln_offset, wo, bo
   block with none (the bucket's padding) writes x unchanged with add_input, else zeros, without the work.
   """
   c, ca, o = x_cm.shape[0], x.shape[1], wo.shape[1]
-  if not (epilogue_supported(c, ca, o) or stream_supported(c, ca, o)):
-    return ref_trimul_epilogue_ln(x_cm, x, in_scale, in_offset, ln_scale, ln_offset, wo, bo, wg, bg, eps=eps,
+  if not (epilogue_supported(c, ca, o) or stream_supported(c, ca, o) or _epilogue_tiled_supported(c, ca, o)):
+    return ref_trimul_epilogue_ln(x_cm, x, in_scale, in_offset, ln_scale, ln_offset, wo, bo, wg, bg, keep, eps=eps,
                                   add_input=add_input).astype(x.dtype)
+  if not epilogue_supported(c, ca, o) and _epilogue_tiled_supported(c, ca, o):
+    return _epilogue_tiled(x_cm, x, in_scale, in_offset, ln_scale, ln_offset, wo, bo, wg, bg, keep, eps=eps,
+                           add_input=add_input)
   return _epilogue(x_cm, x, [ln_scale, ln_offset, wo, bo, wg, bg, in_scale, in_offset], [], x.dtype, eps=eps,
                    block_m=block_m, num_warps=num_warps, num_stages=num_stages, input_ln=True, add_input=add_input,
                    keep=keep)
@@ -522,6 +682,8 @@ def trimul_epilogue_ln(x_cm, x, in_scale, in_offset, ln_scale, ln_offset, wo, bo
 
 def ref_trimul_epilogue_ln(x_cm, x, in_scale, in_offset, ln_scale, ln_offset, wo, bo, wg, bg, keep=None, *, eps=1e-5,
                            add_input=False):
+  if keep is not None:  # the kernels read the product as zeros where keep leaves a row out
+    x_cm = jnp.where(keep.reshape(1, -1) > 0, x_cm, 0)
   act = ref_ln(x.astype(jnp.float32), in_scale, in_offset, eps)
   return ref_trimul_epilogue(x_cm, act, ln_scale, ln_offset, wo, bo, wg, bg, x if add_input else None, eps=eps)
 
