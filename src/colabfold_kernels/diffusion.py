@@ -17,12 +17,14 @@ DEC = H + "diffusion_atom_transformer_decoder/"
 NUM_AF3_RESTYPES = 31
 
 # model conventions that reach the per-step computation (alphafold3/model/model_config.py)
-MODELS = ("openfold3", "openbind0", "protenix1", "protenix2", "mol1", "opendde", "boltz2", "intellifold2",
+MODELS = ("openfold3", "openbind0", "protenix1", "protenix2", "mol1", "opendde", "boltz2", "intellifold2", "helixfold3",
           "rosettafold3", "chai1", "esmfold2", "esmfold2_fast", "esmfold2_lm600m", "esmfold2_lm300m")
-OR_KEY_MASK = ("protenix1", "protenix2", "mol1", "opendde", "boltz2", "intellifold2", "rosettafold3")
+OR_KEY_MASK = ("protenix1", "protenix2", "mol1", "opendde", "boltz2", "intellifold2", "rosettafold3", "helixfold3")
+# rotary q/k by token index and atom slot, no RMSNorm (alphafold3 model_config.SEQ_INDEX_ROPE)
+SEQ_INDEX_ROPE = ("helixfold3",)
 CHAINED_KEY_ADALN = ("protenix1", "protenix2", "mol1", "opendde")
 MASK_TRANSITIONS = ("openfold3", "openbind0")
-PRE_TRUNK_QUERY = ("boltz2", "rosettafold3", "chai1")
+PRE_TRUNK_QUERY = ("boltz2", "rosettafold3", "chai1", "helixfold3")
 PARALLEL_BLOCKS = ("rosettafold3", "chai1")
 ESM_ATOMS = ("esmfold2", "esmfold2_fast", "esmfold2_lm600m", "esmfold2_lm300m")
 PADDED_KEYS_EXCLUDED = OR_KEY_MASK + ("chai1",) + ESM_ATOMS
@@ -44,8 +46,9 @@ INPUTS = [
 BF16 = {"ST0_W1", "ST0_W2", "ST1_W1", "ST1_W2", "WM1", "WM2", "WSE", "WQKVG", "WO", "W1", "W2", "PC", "WTB",
         "WAGGR", "PLW", "PLX", "ENC_WQG", "ENC_WKV", "ENC_WO", "ENC_W1", "ENC_W2",
         "DEC_WQG", "DEC_WKV", "DEC_WO", "DEC_W1", "DEC_W2"}
-# the input contract this module builds: the atom modulations and pair logits in f32, as AF3 runs the atom transformers
-CONTRACT = 2
+# the input contract this module builds: the atom modulations and pair logits in f32, as AF3 runs the atom transformers;
+# 3 adds helixfold3's rotary (SEQROPE), which a contract-2 library would silently ignore
+CONTRACT = 3
 INT32 = {"Q2K", "TOK2Q", "Q2TA", "CHIR_C", "CHIR_PTR", "CHIR_IDX"}
 
 _STATE = {}
@@ -87,8 +90,9 @@ def available():
             import jax
             lib = ctypes.cdll.LoadLibrary(path)
             contract = lib.mk_version() if hasattr(lib, "mk_version") else 1
-            if contract != CONTRACT:
+            if contract not in (2, CONTRACT):
                 raise OSError(f"input contract {contract}, this colabfold-kernels builds {CONTRACT}")
+            _STATE["contract"] = contract
             jax.ffi.register_ffi_target(target, jax.ffi.pycapsule(getattr(lib, target)),
                                         platform="ROCM" if is_rocm() else "CUDA")
             lib.mk_workspace_bytes.restype = ctypes.c_size_t
@@ -107,7 +111,7 @@ def supports(model, sample_config, gpu_cc=None):
         return False
     if gpu_cc is not None and gpu_cc < 80:  # bf16 mma.sync needs Ampere
         return False
-    return available()
+    return available() and (model not in SEQ_INDEX_ROPE or _STATE["contract"] >= 3)
 
 
 # ---------------------------------------------------------------------------------------- helpers
@@ -286,6 +290,19 @@ def _offset_bias(p, norm, w):
     import jax.numpy as jnp
     o = p.get(H + norm + "/offset")
     return jnp.zeros(w.shape[-1], jnp.float32) if o is None else o @ w
+
+
+def _seq_rope(Ab, Nb):
+    """helixfold3's rotary tables as one ROPE input: atom queries, atom keys (cos | sin over 16 frequencies), then
+    tokens (24). Its atom rotation is by slot, a query's in its 32-block and a key's in its window clipped at
+    max(32b - 48, 0); only differences of positions reach the logits, so per atom a query takes
+    a - min(32b - 48, 0) and a key a + 48. In float64: positions run to the atom count."""
+    def table(pos, dim):
+        ang = pos[:, None] * 10000.0 ** (-np.arange(0, dim, 2) / dim)
+        return np.concatenate([np.cos(ang), np.sin(ang)], -1).astype(np.float32).reshape(-1)
+    a = np.arange(Ab, dtype=np.float64)
+    q = a - np.minimum(a // 32 * 32 - 48, 0)
+    return np.concatenate([table(q, 32), table(a + 48, 32), table(np.arange(Nb, dtype=np.float64), 48)])
 
 
 def _gidx(g):
@@ -493,13 +510,17 @@ def _prep(params, model, batch, embeddings, pair_cond, atom_cond, cfg, arch_):
     if esm:
         cos, sin = atom_cond["rope_q"]
         d["ROPE"] = jnp.concatenate([f32(cos).reshape(Ab, 16), f32(sin).reshape(Ab, 16)], -1)
+    elif model in SEQ_INDEX_ROPE:
+        d["ROPE"] = jnp.asarray(_seq_rope(Ab, Nb))
     else:
         d["ROPE"] = none
     flags = (1 * (model in CHAINED_KEY_ADALN) + 2 * (p.tok_opt("ffw_a_to_b/weights", 0) is not None) + 4 * qkn
              + 8 * (model in PARALLEL_BLOCKS) + 16 * chiral + 32 * chai + 64 * (scf is not None)
-             + 128 * chai + 256 * esm + 512 * esm)
-    d["MISC"] = jnp.asarray([cfg.gamma_0, cfg.gamma_min, cfg.noise_scale, cfg.step_scale, flags,
-                             min(80.0 / cfg.steps, 2 ** 0.5 - 1)], jnp.float32)
+             + 128 * chai + 256 * esm + 512 * esm + 1024 * (model in SEQ_INDEX_ROPE))
+    # helixfold3 samples without churn above 1400 real tokens (model_config.SAMPLER_GAMMA_TOKEN_CUTOFF)
+    gamma_0 = jnp.where(jnp.sum(tm) > 1400, 0.0, cfg.gamma_0) if model == "helixfold3" else cfg.gamma_0
+    d["MISC"] = jnp.stack([f32(v) for v in (gamma_0, cfg.gamma_min, cfg.noise_scale, cfg.step_scale, flags,
+                                            min(80.0 / cfg.steps, 2 ** 0.5 - 1))])
 
     # the real extent (a prefix of tokens and of atom subsets) and whether trimming to it is exact
     ar = jnp.arange(Nb)
