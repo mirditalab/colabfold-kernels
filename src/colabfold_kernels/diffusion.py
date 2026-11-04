@@ -347,7 +347,7 @@ def _prep(params, model, batch, embeddings, pair_cond, atom_cond, cfg, arch_):
     # token pair logits: the kernel builds them from the raw pair conditioning and these
     pc = f32(pair_cond)
     mu = pc.mean(-1)
-    d["PC"] = pc
+    d["PC"] = pair_cond  # cast to bf16 from its own dtype: a large fold's pair conditioning arrives bf16, no f32 copy
     d["PCS"] = jnp.stack([mu, 1.0 / jnp.sqrt(((pc - mu[..., None]) ** 2).mean(-1) + 1e-5)], -1)
     extra = embeddings.get("structural_pair_attn_bias")
     d["PLX"] = f32(extra) if extra is not None else jnp.zeros(1, jnp.float32)
