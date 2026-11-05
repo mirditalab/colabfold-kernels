@@ -297,6 +297,25 @@ def live_contraction(global_config, dtype):
           contract.LIVE_ROUND)
 
 
+def _slab_gathered(fn):
+  """An ln_projection without packed_attn's slab: the slab's rows gathered first."""
+  def call(x, ln_scale, ln_offset, w=None, wb=None, keep=None, start=None, *, slab=None, **kw):
+    from colabfold_kernels import packed_attn as pa
+    return fn(x if slab is None else pa.slab_rows(x, start, slab), ln_scale, ln_offset, w, wb, keep, **kw)
+  return call
+
+
+def _slab_scattered(fn):
+  """An output_projection without packed_attn's slab: the slab's residual rows gathered, the result put back."""
+  def call(o, w, b, residual=None, keep=None, start=None, *, slab=None):
+    from colabfold_kernels import packed_attn as pa
+    if slab is None:
+      return fn(o, w, b, residual, keep)
+    i = pa.slab_index(start, slab)
+    return residual.at[i].set(fn(o, w, b, residual[i], keep).astype(residual.dtype))
+  return call
+
+
 def ln_projection(global_config, dtype, num_channel, num_output=None):
   """-> f(x, ln_scale, ln_offset, w, wb, *, eps) -> (p, bias) or None: LayerNorm then the packed and bias projections.
 
@@ -310,15 +329,16 @@ def ln_projection(global_config, dtype, num_channel, num_output=None):
     if not (va.projection_supported(num_channel, *([] if num_output is None else [num_output]))
             and va.fused_available(cc, 'ln_projection')):
       return None
-    return differentiable_via(functools.partial(va.volta_ln_projection, cc=cc), pa.ref_ln_projection,
-                              nondiff=('eps', 'f8_slots', 'f8_scales'))
+    return differentiable_via(_slab_gathered(functools.partial(va.volta_ln_projection, cc=cc)), pa.ref_ln_projection,
+                              nondiff=('eps', 'f8_slots', 'f8_scales', 'slab'))
   if not _pallas_half(global_config, dtype):
     return None
   from colabfold_kernels.grads import differentiable_via
   from colabfold_kernels import packed_attn as pa
   if not pa.ln_projection_supported(num_channel, num_output):
     return None
-  call = differentiable_via(pa.ln_projection, pa.ref_ln_projection, nondiff=('eps', 'f8_slots', 'f8_scales', 'p_dtype'))
+  call = differentiable_via(pa.ln_projection, pa.ref_ln_projection,
+                            nondiff=('eps', 'f8_slots', 'f8_scales', 'p_dtype', 'slab'))
   # the packed slots in f16 for the half softmax packed_attention then runs (half_attention); the bias stays in dtype
   if num_output is not None and half_attention(global_config):
     import jax.numpy as jnp
@@ -335,14 +355,15 @@ def output_projection(global_config, dtype, num_input, num_output):
     va = _volta()
     if not (va.projection_supported(num_input, num_output) and va.fused_available(cc, 'output_projection')):
       return None
-    return differentiable_via(functools.partial(va.volta_output_projection, cc=cc), pa.ref_output_projection)
+    return differentiable_via(_slab_scattered(functools.partial(va.volta_output_projection, cc=cc)),
+                              pa.ref_output_projection, nondiff=('slab',))
   if not _pallas_half(global_config, dtype):
     return None
   from colabfold_kernels.grads import differentiable_via
   from colabfold_kernels import packed_attn as pa
   if not pa.output_projection_supported(num_input, num_output):
     return None
-  return differentiable_via(pa.output_projection, pa.ref_output_projection)
+  return differentiable_via(pa.output_projection, pa.ref_output_projection, nondiff=('slab',))
 
 
 def opm_update(global_config, dtype, num_inner, num_output):
