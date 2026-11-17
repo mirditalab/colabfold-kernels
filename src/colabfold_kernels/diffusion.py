@@ -25,6 +25,9 @@ MASK_TRANSITIONS = ("openfold3", "openbind0")
 PRE_TRUNK_QUERY = ("boltz2", "rosettafold3", "chai1")
 PARALLEL_BLOCKS = ("rosettafold3", "chai1")
 ESM_ATOMS = ("esmfold2", "esmfold2_fast", "esmfold2_lm600m", "esmfold2_lm300m")
+# alphafold3's REALIGN_SAMPLER: boltz2 and ESMFold2 rigid-align the noisy coordinates onto the denoised prediction
+# before each Euler step (their denoisers are not equivariant) -- the kernel's REALIGN step
+REALIGN = ESM_ATOMS + ("boltz2",)
 PADDED_KEYS_EXCLUDED = OR_KEY_MASK + ("chai1",) + ESM_ATOMS
 
 # the kernel's inputs, in its In order
@@ -164,13 +167,26 @@ def _glu_nt(w, w_ab=None):
 
 
 def schedule(cfg, model):
-    """the sampler's noise levels, as diffusion_head.sample builds them"""
+    """the sampler's noise levels, as diffusion_head.sample builds them (noise_schedule_for)
+
+    schedule_tail is how each vendor ends its schedule, and alphafold3 samples with it: 'append' (boltz2, ESMFold2)
+    spaces cfg.steps points and appends sigma 0; 'extend' (intellifold2) appends 0 to the cfg.steps + 1 points;
+    'replace' (protenix, opendde) sets the last point to 0. chai's midpoints take no tail."""
+    tail = "" if model == "chai1" else getattr(cfg, "schedule_tail", "")
     if model == "chai1":  # midpoints of 2N+1
         times = np.linspace(0.0, 1.0, 2 * cfg.steps + 1, dtype=np.float32)[1::2]
+    elif tail == "append":
+        times = np.linspace(0, 1, cfg.steps, dtype=np.float32)
     else:
         times = np.linspace(0, 1, cfg.steps + 1, dtype=np.float32)
     smax, smin, rho = cfg.sigma_max, cfg.sigma_min, cfg.rho
     sig = np.asarray(16.0 * (smax ** (1 / rho) + times * (smin ** (1 / rho) - smax ** (1 / rho))) ** rho, np.float32)
+    if tail in ("append", "extend"):
+        sig = np.concatenate([sig, np.zeros((1,), np.float32)])
+    elif tail == "replace":
+        sig[-1] = 0.0
+    elif tail:
+        raise ValueError(f"schedule_tail {tail!r}: want append, replace or extend")
     if getattr(cfg, "max_sigma", 0.0):
         sig = np.concatenate([[cfg.max_sigma], sig[sig <= cfg.max_sigma]]).astype(np.float32)
     return sig
@@ -497,7 +513,7 @@ def _prep(params, model, batch, embeddings, pair_cond, atom_cond, cfg, arch_):
         d["ROPE"] = none
     flags = (1 * (model in CHAINED_KEY_ADALN) + 2 * (p.tok_opt("ffw_a_to_b/weights", 0) is not None) + 4 * qkn
              + 8 * (model in PARALLEL_BLOCKS) + 16 * chiral + 32 * chai + 64 * (scf is not None)
-             + 128 * chai + 256 * esm + 512 * esm)
+             + 128 * chai + 256 * esm + 512 * (model in REALIGN))
     d["MISC"] = jnp.asarray([cfg.gamma_0, cfg.gamma_min, cfg.noise_scale, cfg.step_scale, flags,
                              min(80.0 / cfg.steps, 2 ** 0.5 - 1)], jnp.float32)
 
