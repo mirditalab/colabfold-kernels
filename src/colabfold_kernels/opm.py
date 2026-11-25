@@ -161,6 +161,7 @@ def opm_outer(left, right, w, *, block_b=32, block_d=4, num_warps=4, num_stages=
   _, B, C = left.shape
   D, E = right.shape[1:]
   F = w.shape[1]
+  assert D % block_d == 0, (D, block_d)  # the grid skips a partial column block, leaving it unwritten
   return pl.pallas_call(
       functools.partial(_outer_kernel, m=B, nc=C, ne=E, block_b=block_b, block_d=block_d),
       grid=(pl.cdiv(B, block_b), D // block_d),
