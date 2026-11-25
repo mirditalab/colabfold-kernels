@@ -344,9 +344,9 @@ def gated_dual_proj(x, wp, bp, wg, bg, mask, *, block_m=None, split=False,
   ci = P // 2
   # at 512 channels the streamed projection loses to XLA (gfx1151: 18.9 against 9.9 ms at 256 tokens)
   stream = channel_major and max(K, ci) > 128 and stream_supported(K, ci, widest=256)
-  if channel_major and max(K, ci) > 128 and not stream:  # whole weights would not fit: XLA
-    g = _half(x, wp, bp, wg, bg, mask, activation, in_kernel=False).T.astype(x.dtype)
-    return g[:ci], g[ci:]
+  if max(K, ci) > 128 and not stream:  # whole weights would not fit: XLA
+    g = _half(x, wp, bp, wg, bg, mask, activation, in_kernel=False).astype(x.dtype)
+    return (g[:, :ci].T, g[:, ci:].T) if channel_major else (g[:, :ci], g[:, ci:])
   # swept on sm_120: 128 rows x 8 warps is 17% faster, but only worth it without a pad copy; ROCm keeps 64 x 4
   wide = not is_rocm()
   if stream:
