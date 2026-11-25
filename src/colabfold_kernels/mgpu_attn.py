@@ -154,8 +154,6 @@ def packed_attention(p, bias, kmask, gate_bias=None, qk8=None, *, sm_scale, colu
         plgpu.copy_gmem_to_smem(gb_ref.at[h], gb_smem.at[wg], q_bar.at[wg])
       plgpu.barrier_wait(q_bar.at[wg])
       q = plgpu.load(q_smem.at[wg], layout=QK_LHS)
-      if not fp8:
-        q = (q.astype(jnp.float32) * (sm_scale * LOG2E)).astype(dt)
       # the gate reuses q's buffer: the copy's warpgroup sync orders it after every warp's q load
       if gated:
         plgpu.copy_gmem_to_smem(rows_of(p_ref, b, gs, h).at[qrows], buf.at[wg], g_bar.at[wg])
@@ -166,9 +164,12 @@ def packed_attention(p, bias, kmask, gate_bias=None, qk8=None, *, sm_scale, colu
         plgpu.barrier_wait(produced.at[slot])
         kt = plgpu.load(plgpu.transpose_ref(k_smem.at[slot, wg], (1, 0)), layout=QK_RHS)
         ka = plgpu.load(ka_smem.at[slot, wg], layout=ACC.reduce(0))
-        # scores in log2 units, accumulated onto bias + key mask
-        acc = plgpu.load(b_smem.at[slot], layout=ACC).astype(jnp.float32) * LOG2E + lax.broadcast_in_dim(ka, (bq, bk), [1])
+        # scores in log2 units, accumulated onto bias + key mask; unrounded bf16 q is scaled after the MMA
+        acc = plgpu.load(b_smem.at[slot], layout=ACC).astype(jnp.float32) * (LOG2E if fp8 else 1 / sm_scale)
         sc = plgpu.mma(acc, q, kt)
+        if not fp8:
+          sc = sc * (sm_scale * LOG2E)
+        sc = sc + lax.broadcast_in_dim(ka, (bq, bk), [1])
         m_new = jnp.maximum(m, sc.max(axis=1))
         corr = jnp.exp2(m - m_new)
         pr = jnp.exp2(sc - lax.broadcast_in_dim(m_new, sc.shape, [0]))
