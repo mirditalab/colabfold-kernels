@@ -313,6 +313,7 @@ def _gidx(g):
 # ---------------------------------------------------------------------------------------- prep
 def _prep(params, model, batch, embeddings, pair_cond, atom_cond, cfg, arch_):
     """(inputs in In order, int32 extent record without the seed, flags)"""
+    import jax
     import jax.numpy as jnp
     p = _Params(params, model)
     f32 = lambda a: jnp.asarray(a, jnp.float32)
@@ -402,7 +403,8 @@ def _prep(params, model, batch, embeddings, pair_cond, atom_cond, cfg, arch_):
     PLW = jnp.stack(plw)
     d["PLW"] = PLW
     d["PLB"] = jnp.stack(plb)
-    d["PLWS"] = PLW.astype(jnp.bfloat16).astype(jnp.float32).sum(-1)
+    # reduce_precision: XLA's excess precision drops a cast round trip, summing the unrounded PLW
+    d["PLWS"] = jax.lax.reduce_precision(PLW, 8, 7).sum(-1)
     d["TMASK"] = tm
     d["WTB"] = (p[H + "output_norm/scale"][:, None] * p[H + "diffusion_project_token_features_for_broadcast/weights"]).T
     d["WPOS"] = p[H + "diffusion_atom_positions_to_features/weights"]

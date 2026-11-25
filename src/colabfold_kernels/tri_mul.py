@@ -180,7 +180,8 @@ def _ln_gdp_persistent(x, ln_scale, ln_offset, wp, bp, wg, bg, mask, *, eps, blo
 def _fold(w, scale, offset, b, dtype):
   """LN(x) w + b = rstd (x w' - mean colsum(w')) + offset w + b with w' = scale w, so the raw rows feed the MMA:
   w' in dtype and [colsum(w'), offset w + b], the colsum of the rounded w' the MMA reads."""
-  ws = (scale.astype(jnp.float32)[:, None] * w.astype(jnp.float32)).astype(dtype)
+  # behind a barrier: XLA's excess precision drops a bare cast round trip, reduce_precision flushes f16 subnormals
+  ws = jax.lax.optimization_barrier((scale.astype(jnp.float32)[:, None] * w.astype(jnp.float32)).astype(dtype))
   return ws, jnp.stack([ws.astype(jnp.float32).sum(0),
                         offset.astype(jnp.float32) @ w.astype(jnp.float32) + b.astype(jnp.float32)])
 

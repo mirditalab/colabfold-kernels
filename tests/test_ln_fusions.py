@@ -91,6 +91,16 @@ for a, ci, m in ((256, 256, 4101), (512, 512, 127), (320, 320, 4101), (448, 448,
     check(f"epilogue_ln streamed a={a} m={m} add_input={add}",
           lambda *z, add=add: fused_ops.trimul_epilogue_ln(gc, dt)(*z, add_input=add),
           lambda *z, add=add: tm.ref_trimul_epilogue_ln(*z, add_input=add), [f(ci, m, s=2.), x, sc, of, *ep], [0, 1])
+# rows far off zero: the folded LN's mean correction cancels exactly only against the colsum of the rounded weights
+off = lambda m, a: jnp.asarray(rng.standard_normal((m, a)) + 16 * rng.standard_normal((m, 1)), dt)
+for a, m in ((128, 4101), (256, 4101), (320, 777)):
+  sc, of, ones = f32(a), f32(a), jnp.ones((m,), dt)
+  if a <= 256 or tm.tiled_supported(a, a):
+    check(f"ln_gdp rows off zero a={a}", fused_ops.ln_gated_dual_proj(gc, dt, a, a), tm.ref_ln_gdp,
+          [off(m, a), sc, of, f(a, 2 * a, s=.1), f(2 * a, s=.1), f(a, 2 * a, s=.1), f(2 * a, s=.1), ones], [3], tol=.01)
+  ep = [f32(a), f32(a), f(a, a, s=.1), f(a, s=.1), f(a, a, s=.1), f(a, s=.1)]
+  check(f"epilogue_ln rows off zero a={a}", lambda *z: fused_ops.trimul_epilogue_ln(gc, dt)(*z, add_input=False),
+        lambda *z: tm.ref_trimul_epilogue_ln(*z, add_input=False), [off(m, a).T, off(m, a), sc, of, *ep], [6], tol=.01)
 assert (fused_ops.ln_gated_dual_proj(gc, dt, 512, 512) is not None) == tm.tiled_supported(512, 512)
 assert fused_ops.ln_gated_dual_proj(gc, dt, 640, 640) is None
 
