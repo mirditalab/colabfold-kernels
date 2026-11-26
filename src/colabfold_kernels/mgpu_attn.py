@@ -164,12 +164,13 @@ def packed_attention(p, bias, kmask, gate_bias=None, qk8=None, *, sm_scale, colu
         plgpu.barrier_wait(produced.at[slot])
         kt = plgpu.load(plgpu.transpose_ref(k_smem.at[slot, wg], (1, 0)), layout=QK_RHS)
         ka = plgpu.load(ka_smem.at[slot, wg], layout=ACC.reduce(0))
-        # scores in log2 units, accumulated onto bias + key mask; unrounded bf16 q is scaled after the MMA
+        # scores in log2 units, accumulated onto bias; unrounded bf16 q is scaled after the MMA
         acc = plgpu.load(b_smem.at[slot], layout=ACC).astype(jnp.float32) * (LOG2E if fp8 else 1 / sm_scale)
         sc = plgpu.mma(acc, q, kt)
         if not fp8:
           sc = sc * (sm_scale * LOG2E)
-        sc = sc + lax.broadcast_in_dim(ka, (bq, bk), [1])
+        ka = lax.broadcast_in_dim(ka, (bq, bk), [1])
+        sc = jnp.where(ka < 0, ka, sc)  # a masked key's score is replaced, not added to: its bias may be inf
         m_new = jnp.maximum(m, sc.max(axis=1))
         corr = jnp.exp2(m - m_new)
         pr = jnp.exp2(sc - lax.broadcast_in_dim(m_new, sc.shape, [0]))

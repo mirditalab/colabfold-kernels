@@ -71,8 +71,36 @@ def case(S, n, column, mosaic, fp8, holes=False, poison=False):
   check(name, o, base, base.astype(jnp.float32) if fp8 else ref, keep)
 
 
+def masked_bias(S, column, mosaic, fill):
+  """a masked key's score is replaced, so inf or NaN in its bias changes nothing"""
+  k = jax.random.split(jax.random.PRNGKey(S), 4)
+  p = jax.random.normal(k[0], (S, S, 4, H, D)).astype(jnp.bfloat16)
+  bias = jax.random.normal(k[1], (H, S, S)).astype(jnp.bfloat16)
+  gb = jax.random.normal(k[2], (H, D)).astype(jnp.bfloat16)
+  tok = jax.random.uniform(k[3], (S,)) > 0.2
+  kmask = tok[:, None] & tok[None, :]
+  bad = jnp.where(tok[None, None, :], bias, fill).astype(bias.dtype)
+  kw = dict(sm_scale=D ** -0.5, column=column)
+  f = fused_ops._mgpu_attn().packed_attention if mosaic else pa.packed_attention
+  ref = pa.ref_packed_attention(p, bias, kmask, gb, **kw).astype(jnp.float32)
+  rows = kmask.any(axis=1)[:, None] & jnp.ones((1, S), bool)
+  for trim in (False, True):
+    o = f(p, bad, kmask, gb, trim=trim, **kw).astype(jnp.float32)
+    keep = jnp.broadcast_to((rows.T if column else rows)[:, :, None, None], o.shape)
+    err = float(jnp.abs(jnp.where(keep, o - ref, 0)).max())
+    ok = bool(jnp.isfinite(o).all()) and err < 0.05
+    name = f"{'mosaic' if mosaic else 'triton'} S={S} {'col' if column else 'row'} bias {fill} at masked keys trim={trim}"
+    print(f"{'ok  ' if ok else 'BAD '}{name}: vs f32 {err:.3g}")
+    if not ok:
+      fails.append(name)
+
+
 mosaic_ok = fused_ops._mgpu_attn() is not None
 fp8_ok = fused_ops.fp8_attention_slots({'fp8': True}, None, D, 0) is not None or mosaic_ok
+for mosaic in ([False, True] if mosaic_ok else [False]):
+  for fill in (jnp.inf, -jnp.inf, jnp.nan):
+    masked_bias(256, False, mosaic, fill)
+  masked_bias(256, True, mosaic, jnp.nan)
 for mosaic in ([False, True] if mosaic_ok else [False]):
   for S, n in [(256, 256), (256, 255), (256, 129), (256, 128), (256, 127), (256, 31), (384, 257), (384, 1)]:
     for column in (False, True):
