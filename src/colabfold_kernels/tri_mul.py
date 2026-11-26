@@ -40,7 +40,6 @@ def _gdp_kernel_tiled(x_ref, wp_ref, bp_ref, wg_ref, bg_ref, mask_ref, o_ref, *,
 def _half(x, wp, bp, wg, bg, mask, activation, in_kernel=True):
   proj = _dot(x, wp) + bp[None, :].astype(jnp.float32)
   gate = _dot(x, wg) + bg[None, :].astype(jnp.float32)
-  # fast()'s tanh forms are Pallas-only on CUDA
   return mask[:, None].astype(jnp.float32) * proj * (fast(activation) if in_kernel else activation)(gate)
 
 

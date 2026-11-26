@@ -38,23 +38,33 @@ def unless_padding(keep_ref, rows, compute, padding, other=-1):
   pl.when(top == 0)(padding)
 
 
+def _ptx(op, x):
+  """In a kernel: one f32 PTX instruction op on x."""
+  [r] = plgpu.elementwise_inline_asm(f"{op} $0, $1;", args=[x], constraints="=f,f", pack=1,
+                                     result_shape_dtypes=[jax.ShapeDtypeStruct(x.shape, jnp.float32)])
+  return r
+
+
 def sigmoid(x):
-  """In a kernel: sigmoid as 0.5 + 0.5 tanh(x / 2), one MUFU.TANH on CUDA instead of an exp and an IEEE divide."""
+  """In a kernel: t / (1 + t) or 1 / (1 + t), t = 2^(-|x| log2 e), as ex2 and rcp.approx on CUDA. Exact in both tails,
+  unlike 0.5 + 0.5 tanh(x / 2), which cancels below x ~ -8, where IntelliFold-v2's gates and swish inputs sit."""
   if is_rocm():
     return jax.nn.sigmoid(x)
-  return 0.5 + 0.5 * plgpu.approx_tanh(0.5 * x)
+  x = x.astype(jnp.float32)
+  t = _ptx("ex2.approx.ftz.f32", jnp.abs(x) * -1.4426950408889634)
+  r = _ptx("rcp.approx.ftz.f32", 1.0 + t)
+  return jnp.where(x >= 0, r, t * r)
 
 
 def swish(x):
-  """In a kernel: x sigmoid(x) as h + h tanh(h), h = x / 2."""
+  """In a kernel: x sigmoid(x)."""
   if is_rocm():
     return jax.nn.swish(x)
-  h = 0.5 * x
-  return h + h * plgpu.approx_tanh(h)
+  return x * sigmoid(x)
 
 
 def fast(activation):
-  """The tanh form of a sigmoid or swish activation; any other passes through."""
+  """The in-kernel form of a sigmoid or swish activation; any other passes through."""
   return {jax.nn.sigmoid: sigmoid, jax.nn.swish: swish}.get(activation, activation)
 
 
