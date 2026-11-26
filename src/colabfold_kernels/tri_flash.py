@@ -290,18 +290,46 @@ def tri_flash(q, k, v, bias, kmask, *, sm_scale, block_q=64, block_k=64,
   )(q, k, v, bias, kmask)
 
 
+def _probs(qcs, kcs, docs, vcs, bias, live, kb, lse, delta, sm_scale, sk):
+  """p and dS of a [block_q, block_k] tile from the head-dim chunks of its q, k, dO and v"""
+  qk = None
+  dp = None
+  for qc, kc, doc, vc in zip(qcs, kcs, docs, vcs):
+    part = _dot(qc, kc.T)
+    qk = part if qk is None else qk + part
+    part = _dot(doc, vc.T)
+    dp = part if dp is None else dp + part
+  # the clamp the forward used, so an all-masked row differentiates the
+  # uniform softmax it was given
+  s = jnp.where(live, (qk * sm_scale + bias) * LOG2E, NEG)
+  # NEG absorbs log2(l) in a fully masked row's lse, whose forward was the uniform 1/Sk
+  p = jnp.where(lse[:, None] <= NEG / 2, jnp.where(kb, 1. / sk, 0.)[None, :], jnp.exp2(s - lse[:, None]))
+  # a masked logit is a constant, thus nothing flows back through it
+  return p, jnp.where(live, p * (dp - delta[:, None]), 0.0)
+
+
+def _mask(b, c, w):
+  """the full 2d mask of a chunk of w columns (c: which are real, None: all) on rows b"""
+  return jnp.broadcast_to(b[:, None], (b.shape[0], w)) if c is None else b[:, None] & c[None, :]
+
+
+def _chunks_at(ref, sl, b, chunks, cols, row=()):
+  # one indexer: Pallas Triton cannot load through ref.at[r].at[...]
+  return [plgpu.load(ref.at[(*row, sl, pl.dslice(off, w))], mask=_mask(b, c, w), other=0.0)
+          for (off, w), c in zip(chunks, cols)]
+
+
 def _bwd_kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, do_ref, lse_ref, delta_ref,
-                _zq_ref, _zb_ref, dq_ref, dk_ref, dv_ref, dbias_ref, *,
+                dk_ref, dv_ref, *,
                 sm_scale, block_q, block_k, sq, sk, d, chunks):
-  # One k block per program, sweeping q: dK/dV accumulate in registers, while dQ
-  # and dBias land from every k block and so go through atomics. The head dim is
+  # One k block per program, sweeping q: dK/dV accumulate in registers. The head dim is
   # split the way the forward splits it, so only the widest chunk has to fit.
   start_k = pl.program_id(0) * block_k
   offs_k = start_k + jnp.arange(block_k)
   kb = offs_k < sk
   ks = pl.dslice(start_k, block_k)
   cols = [None if off + w <= d else (off + jnp.arange(w)) < d for off, w in chunks]
-  # full 2d masks: a load broadcasts a [rows, 1] mask, an atomic does not
+  # full 2d masks: a load broadcasts a [rows, 1] mask, the stores take them too
   kvm = [jnp.broadcast_to(kb[:, None], (block_k, w)) if c is None
          else kb[:, None] & c[None, :] for (_, w), c in zip(chunks, cols)]
   kcs = [plgpu.load(k_ref.at[ks, pl.dslice(off, w)], mask=m, other=0.0)
@@ -326,32 +354,12 @@ def _bwd_kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, do_ref, lse_ref, delta
     delta = plgpu.load(delta_ref.at[qs], mask=qb, other=0.0)
     bias = plgpu.load(bias_ref.at[qs, ks], mask=qb[:, None] & kb[None, :], other=0.0)
 
-    qk = None
-    dp = None
-    for qc, kc, doc, vc in zip(qcs, kcs, docs, vcs):
-      part = _dot(qc, kc.T)
-      qk = part if qk is None else qk + part
-      part = _dot(doc, vc.T)
-      dp = part if dp is None else dp + part
-    live = qb[:, None] & (km & kb)[None, :]
-    # the clamp the forward used, so an all-masked row differentiates the
-    # uniform softmax it was given
-    s = jnp.where(live, (qk * sm_scale + bias) * LOG2E, NEG)
-    # NEG absorbs log2(l) in a fully masked row's lse, whose forward was the uniform 1/Sk
-    p = jnp.where(lse[:, None] <= NEG / 2, jnp.where(kb, 1. / sk, 0.)[None, :], jnp.exp2(s - lse[:, None]))
-    # a masked logit is a constant, thus nothing flows back through it
-    ds = jnp.where(live, p * (dp - delta[:, None]), 0.0)
+    p, ds = _probs(qcs, kcs, docs, vcs, bias, qb[:, None] & (km & kb)[None, :], kb, lse, delta, sm_scale, sk)
 
     dk_next, dv_next = [], []
     for j, (qc, doc) in enumerate(zip(qcs, docs)):
       dv_next.append(dv_acc[j] + _dot(p.astype(doc.dtype).T, doc))
       dk_next.append(dk_acc[j] + _dot(ds.astype(qc.dtype).T, qc))
-    for (off, w), kc, m in zip(chunks, kcs, qm):
-      plgpu.atomic_add(dq_ref, (qs, pl.dslice(off, w)),
-                       (_dot(ds.astype(kc.dtype), kc) * sm_scale).astype(dq_ref.dtype),
-                       mask=m)
-    plgpu.atomic_add(dbias_ref, (qs, ks), ds.astype(dbias_ref.dtype),
-                     mask=qb[:, None] & kb[None, :])
     return dk_next, dv_next
 
   zero = [jnp.zeros((block_k, w), jnp.float32) for _, w in chunks]
@@ -362,12 +370,60 @@ def _bwd_kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, do_ref, lse_ref, delta
     plgpu.store(dv_ref.at[ks, pl.dslice(off, w)], dvc.astype(dv_ref.dtype), mask=m)
 
 
+def _bwd_q_kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, do_ref, lse_ref, delta_ref, dq_ref, *,
+                  sm_scale, block_q, block_k, sq, sk, d, chunks):
+  # one q block per program, sweeping k: dQ accumulates in registers, in key order
+  start_q = pl.program_id(0) * block_q
+  qb = start_q + jnp.arange(block_q) < sq
+  qs = pl.dslice(start_q, block_q)
+  cols = [None if off + w <= d else (off + jnp.arange(w)) < d for off, w in chunks]
+  qcs, docs = (_chunks_at(r, qs, qb, chunks, cols) for r in (q_ref, do_ref))
+  lse = plgpu.load(lse_ref.at[qs], mask=qb, other=0.0)
+  delta = plgpu.load(delta_ref.at[qs], mask=qb, other=0.0)
+
+  def body(j, dq_acc):
+    kb = j * block_k + jnp.arange(block_k) < sk
+    ks = pl.dslice(j * block_k, block_k)
+    kcs, vcs = (_chunks_at(r, ks, kb, chunks, cols) for r in (k_ref, v_ref))
+    km = plgpu.load(kmask_ref.at[ks], mask=kb, other=False)
+    bias = plgpu.load(bias_ref.at[qs, ks], mask=qb[:, None] & kb[None, :], other=0.0)
+    _, ds = _probs(qcs, kcs, docs, vcs, bias, qb[:, None] & (km & kb)[None, :], kb, lse, delta, sm_scale, sk)
+    return [a + _dot(ds.astype(kc.dtype), kc) for a, kc in zip(dq_acc, kcs)]
+
+  dq_acc = jax.lax.fori_loop(0, pl.cdiv(sk, block_k), body, [jnp.zeros((block_q, w), jnp.float32) for _, w in chunks])
+  for (off, w), a, c in zip(chunks, dq_acc, cols):
+    plgpu.store(dq_ref.at[qs, pl.dslice(off, w)], (a * sm_scale).astype(dq_ref.dtype), mask=_mask(qb, c, w))
+
+
+def _bwd_bias_kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, do_ref, lse_ref, delta_ref, db_ref, *,
+                     sm_scale, block_q, block_k, sq, sk, d, chunks, n):
+  # one (q, k) tile per program, sweeping the rows that share the bias: dBias accumulates in registers, in row order
+  qb = pl.program_id(0) * block_q + jnp.arange(block_q) < sq
+  kb = pl.program_id(1) * block_k + jnp.arange(block_k) < sk
+  qs, ks = pl.dslice(pl.program_id(0) * block_q, block_q), pl.dslice(pl.program_id(1) * block_k, block_k)
+  cols = [None if off + w <= d else (off + jnp.arange(w)) < d for off, w in chunks]
+  bias = plgpu.load(bias_ref.at[qs, ks], mask=qb[:, None] & kb[None, :], other=0.0)
+
+  def body(r, acc):
+    qcs, docs = (_chunks_at(x, qs, qb, chunks, cols, (r,)) for x in (q_ref, do_ref))
+    kcs, vcs = (_chunks_at(x, ks, kb, chunks, cols, (r,)) for x in (k_ref, v_ref))
+    km = plgpu.load(kmask_ref.at[r, ks], mask=kb, other=False)
+    lse = plgpu.load(lse_ref.at[r, qs], mask=qb, other=0.0)
+    delta = plgpu.load(delta_ref.at[r, qs], mask=qb, other=0.0)
+    _, ds = _probs(qcs, kcs, docs, vcs, bias, qb[:, None] & (km & kb)[None, :], kb, lse, delta, sm_scale, sk)
+    return acc + ds
+
+  acc = jax.lax.fori_loop(0, n, body, jnp.zeros((block_q, block_k), jnp.float32))
+  plgpu.store(db_ref.at[qs, ks], acc.astype(db_ref.dtype), mask=qb[:, None] & kb[None, :])
+
+
 @functools.partial(jax.jit, static_argnames=(
     "sm_scale", "block_q", "block_k", "num_warps", "num_stages", "seq_major"))
 def tri_flash_bwd(q, k, v, bias, kmask, out, dout, lse, *, sm_scale,
                   block_q=64, block_k=64, num_warps=4, num_stages=2,
                   seq_major=False):
-  """dQ, dK, dV and dBias. lse comes from the forward with want_lse."""
+  """dQ, dK, dV and dBias, each summed in a fixed order: no atomics, so the same inputs give the same bits.
+  lse comes from the forward with want_lse."""
   if seq_major:
     N, Sq, H, D = q.shape
     Sk = k.shape[1]
@@ -380,8 +436,7 @@ def tri_flash_bwd(q, k, v, bias, kmask, out, dout, lse, *, sm_scale,
   delta = jnp.sum(out.astype(jnp.float32) * dout.astype(jnp.float32), axis=-1)
   if seq_major:
     delta = delta.transpose(0, 2, 1)          # [N, H, Sq] like lse
-  # grid (k block, head, row): row innermost keeps bias and dbias hot, as in the
-  # forward, and dbias is shared across rows so its atomics want that most.
+  # grid (k block, head, row): row innermost keeps bias hot, as in the forward.
   grid = (pl.cdiv(Sk, block_k), H, N)
   if seq_major:
     bs_q = pl.BlockSpec((None, Sq, None, tile), lambda i, h, j: (j, 0, h, 0))
@@ -392,24 +447,32 @@ def tri_flash_bwd(q, k, v, bias, kmask, out, dout, lse, *, sm_scale,
   bs_bias = pl.BlockSpec((None, Sq, Sk), lambda i, h, j: (h, 0, 0))
   bs_mask = pl.BlockSpec((None, Sk), lambda i, h, j: (j, 0))
   bs_row = pl.BlockSpec((None, None, Sq), lambda i, h, j: (j, h, 0))
-  zeros_q = jnp.zeros(q.shape, jnp.float32)
-  zeros_b = jnp.zeros((H, Sq, Sk), jnp.float32)
-  dq, dk, dv, dbias = pl.pallas_call(
-      functools.partial(_bwd_kernel, sm_scale=sm_scale, block_q=block_q,
-                        block_k=block_k, sq=Sq, sk=Sk, d=D, chunks=chunks),
-      grid=grid,
-      in_specs=[bs_q, bs_k, bs_k, bs_bias, bs_mask, bs_q, bs_row, bs_row,
-                bs_q, bs_bias],
-      out_specs=[bs_q, bs_k, bs_k, bs_bias],
-      out_shape=[jax.ShapeDtypeStruct(q.shape, jnp.float32),
-                 jax.ShapeDtypeStruct(k.shape, k.dtype),
-                 jax.ShapeDtypeStruct(v.shape, v.dtype),
-                 jax.ShapeDtypeStruct((H, Sq, Sk), jnp.float32)],
-      # dq and dbias accumulate, thus they start at zero and alias their input
-      input_output_aliases={8: 0, 9: 3},
-      compiler_params=plgpu.CompilerParams(num_warps=num_warps, num_stages=num_stages),
-      name="tri_flash_bwd",
-  )(q, k, v, bias, kmask, dout, lse, delta, zeros_q, zeros_b)
+  kw = dict(sm_scale=sm_scale, block_q=block_q, block_k=block_k, sq=Sq, sk=Sk, d=D, chunks=chunks)
+  cp = plgpu.CompilerParams(num_warps=num_warps, num_stages=num_stages)
+  args = (q, k, v, bias, kmask, dout, lse, delta)
+  in_specs = [bs_q, bs_k, bs_k, bs_bias, bs_mask, bs_q, bs_row, bs_row]
+  dk, dv = pl.pallas_call(
+      functools.partial(_bwd_kernel, **kw), grid=grid, in_specs=in_specs, out_specs=[bs_k, bs_k],
+      out_shape=[jax.ShapeDtypeStruct(k.shape, k.dtype), jax.ShapeDtypeStruct(v.shape, v.dtype)],
+      compiler_params=cp, name="tri_flash_bwd")(*args)
+  # the specs ignore the first grid axis, so they serve a q block per program as well
+  dq = pl.pallas_call(
+      functools.partial(_bwd_q_kernel, **kw), grid=(pl.cdiv(Sq, block_q), H, N), in_specs=in_specs, out_specs=bs_q,
+      out_shape=jax.ShapeDtypeStruct(q.shape, jnp.float32), compiler_params=cp, name="tri_flash_bwd_q")(*args)
+  # dbias: a (q, k) tile per program over every row
+  if seq_major:
+    all_q = pl.BlockSpec((N, Sq, None, tile), lambda i, j, h: (0, 0, h, 0))
+    all_k = pl.BlockSpec((N, Sk, None, tile), lambda i, j, h: (0, 0, h, 0))
+  else:
+    all_q = pl.BlockSpec((N, None, Sq, tile), lambda i, j, h: (0, h, 0, 0))
+    all_k = pl.BlockSpec((N, None, Sk, tile), lambda i, j, h: (0, h, 0, 0))
+  all_row = pl.BlockSpec((N, None, Sq), lambda i, j, h: (0, h, 0))
+  head = pl.BlockSpec((None, Sq, Sk), lambda i, j, h: (h, 0, 0))
+  dbias = pl.pallas_call(
+      functools.partial(_bwd_bias_kernel, n=N, **kw), grid=(pl.cdiv(Sq, block_q), pl.cdiv(Sk, block_k), H),
+      in_specs=[all_q, all_k, all_k, head, pl.BlockSpec((N, Sk), lambda i, j, h: (0, 0)), all_q, all_row, all_row],
+      out_specs=head, out_shape=jax.ShapeDtypeStruct((H, Sq, Sk), jnp.float32), compiler_params=cp,
+      name="tri_flash_bwd_bias")(*args)
   return dq.astype(q.dtype), dk, dv, dbias
 
 

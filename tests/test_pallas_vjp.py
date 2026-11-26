@@ -38,6 +38,9 @@ for b, h, sq, sk, c in ((2, 4, 96, 96, 32), (2, 4, 70, 83, 16), (1, 8, 64, 64, 4
     ref_f = lambda *a: reference(a[0], a[1], a[2], mb, a[3], scale)
     o = jax.jit(ours_f)(q, k, v, nb)
     g = jax.jit(jax.grad(lambda *a: loss(ours_f, *a), argnums=(0, 1, 2, 3)))(q, k, v, nb)
+    # no atomics: a second run gives the same bits
+    same = all(bool(jnp.array_equal(x, y)) for x, y in
+               zip(g, jax.jit(jax.grad(lambda *a: loss(ours_f, *a), argnums=(0, 1, 2, 3)))(q, k, v, nb)))
     r = ref_f(q, k, v, nb)
     rg = jax.jit(jax.grad(lambda *a: loss(ref_f, *a), argnums=(0, 1, 2, 3)))(q, k, v, nb)
     # asking for lse must not perturb the output the inference path returns
@@ -47,9 +50,9 @@ for b, h, sq, sk, c in ((2, 4, 96, 96, 32), (2, 4, 70, 83, 16), (1, 8, 64, 64, 4
     rows = [("out", o, r), ("out|lse", o2, np.asarray(o))] + list(
         zip(("dq", "dk", "dv", "dbias"), g, rg))
     worst = max(rel(x, y) for _, x, y in rows)
-    bad += worst >= 0.02
+    bad += worst >= 0.02 or not same
     print(f"  b={b} h={h} sq={sq} sk={sk} c={c:2d}   " +
           "  ".join(f"{n} {rel(x,y):.1e}" for n, x, y in rows) +
-          f"   {'OK' if worst < 0.02 else 'FAIL'}")
+          f"  rerun {'same' if same else 'DIFFERS'}   {'OK' if worst < 0.02 and same else 'FAIL'}")
 print("RESULT:", "PASS" if not bad else f"FAIL ({bad})")
 sys.exit(0 if not bad else 1)
